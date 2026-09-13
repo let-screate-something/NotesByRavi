@@ -1,0 +1,13 @@
+Photosynthesis: How Plants Make Food
+Photosynthesis is the process by which green plants, algae and some bacteria convert light energy into chemical energy stored in glucose.
+Definition: Photosynthesis - the conversion of light energy into chemical energy by chlorophyll-containing organisms.
+The overall equation is: 6CO2 + 6H2O + light energy -> C6H12O6 + 6O2.
+It happens inside chloroplasts, which contain the green pigment chlorophyll.
+Light-dependent reactions occur in the thylakoid membranes and produce ATP and NADPH.
+Tip: Remember that the light reactions need water and light, and they release oxygen as a by-product.
+The Calvin cycle, also called light-independent reactions, occurs in the stroma and uses ATP and NADPH to fix carbon dioxide into glucose.
+Factors affecting the rate of photosynthesis include light intensity, carbon dioxide concentration, temperature and water availability.
+Note: Excessively high temperatures denature enzymes, which reduces the rate of photosynthesis.
+Example: A leaf placed in darkness will stop releasing oxygen because the light reactions shut down.
+Plants use glucose for respiration, to build cellulose cell walls, and to store energy as starch.
+Key Equation: 6CO2 + 6H2O + light -> C6H12O6 + 6O2 (occurs in the chloroplast)
