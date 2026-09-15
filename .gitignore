@@ -1,0 +1,9 @@
+api_keys.md
+.env
+config.json
+__pycache__/
+*.pyc
+output/*_pngs/
+.DS_Store
+*.tmp
+_notes_tmp/

@@ -60,8 +60,114 @@ def load_theme(name):
     t.setdefault("arrow_color", t.get("bullet", (0, 0, 0)))
     return t
 
+
+# ---- glyph safety ---------------------------------------------------------
+# The handwriting fonts do not contain every Unicode glyph an AI or a PDF may
+# emit (Greek letters, non-breaking hyphens, arrows, super/subscripts...).
+# Drawing an unsupported glyph silently produces a blank box, so map anything
+# the fonts lack onto a readable ASCII equivalent before rendering.
+
+_ASCII_FALLBACK = {
+    "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-", "\u2014": "-",
+    "\u2015": "-", "\u00ad": "-", "\u2212": "-",
+    "\u2192": "->", "\u2190": "<-", "\u21d2": "=>", "\u21d4": "<=>",
+    "\u2026": "...", "\u2022": "*", "\u00b7": "*", "\u25cf": "*",
+    "\u25aa": "*", "\u25a0": "*", "\u2043": "-",
+    "\u00a0": " ", "\u2009": " ", "\u200a": " ", "\u200b": "", "\u202f": " ",
+    "\u2032": "'", "\u2033": '"', "\u02bc": "'",
+    "\u00d7": "x", "\u00f7": "/", "\u2264": "<=", "\u2265": ">=",
+    "\u2260": "!=", "\u2248": "~", "\u221e": "inf", "\u00b1": "+/-",
+    "\u2245": "~=", "\u221d": "prop to", "\u2211": "Sum", "\u220f": "Prod",
+    "\u222b": "Integral", "\u2202": "d", "\u2206": "delta",
+    "\u00b2": "^2", "\u00b3": "^3", "\u00b9": "^1", "\u2070": "^0",
+    "\u2074": "^4", "\u2075": "^5", "\u2076": "^6", "\u2077": "^7",
+    "\u2078": "^8", "\u2079": "^9",
+    "\u00bd": "1/2", "\u00bc": "1/4", "\u00be": "3/4", "\u2153": "1/3",
+    "\u2154": "2/3",
+    "\u20b9": "Rs.", "\u20ac": "EUR", "\u00a3": "GBP", "\u00a5": "JPY",
+    "\u03b1": "alpha", "\u03b2": "beta", "\u03b3": "gamma", "\u03b4": "delta",
+    "\u03b5": "eps", "\u03b6": "zeta", "\u03b7": "eta", "\u03b8": "theta",
+    "\u03b9": "iota", "\u03ba": "kappa", "\u03bb": "lambda", "\u03bc": "mu",
+    "\u03bd": "nu", "\u03be": "xi", "\u03c0": "pi", "\u03c1": "rho",
+    "\u03c2": "sigma", "\u03c3": "sigma", "\u03c4": "tau", "\u03c5": "upsilon",
+    "\u03c6": "phi", "\u03c7": "chi", "\u03c8": "psi", "\u03c9": "omega",
+    "\u0393": "Gamma", "\u0394": "Delta", "\u0398": "Theta", "\u039b": "Lambda",
+    "\u039e": "Xi", "\u03a0": "Pi", "\u03a3": "Sum", "\u03a6": "Phi",
+    "\u03a8": "Psi", "\u03a9": "Omega",
+}
+
+
+def _font_coverage():
+    """Set of unicode code points covered by the bundled handwriting fonts."""
+    chars = set()
+    try:
+        from fontTools.ttLib import TTFont
+        for path in FONT_FILES.values():
+            try:
+                chars |= set(TTFont(path, lazy=True).getBestCmap().keys())
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return chars or None
+
+
+_COVERAGE = _font_coverage()
+
+# Unicode subscript / superscript -> ASCII (H2O, CO2, e-, x^2 ...)
+_SUBSUPER = {
+    "\u2070": "0", "\u00b9": "1", "\u00b2": "2", "\u00b3": "3",
+    "\u2074": "4", "\u2075": "5", "\u2076": "6", "\u2077": "7",
+    "\u2078": "8", "\u2079": "9",
+    "\u2080": "0", "\u2081": "1", "\u2082": "2", "\u2083": "3",
+    "\u2084": "4", "\u2085": "5", "\u2086": "6", "\u2087": "7",
+    "\u2088": "8", "\u2089": "9",
+    "\u2090": "a", "\u2091": "e", "\u2092": "o", "\u2093": "x",
+    "\u2095": "h", "\u2096": "k", "\u2097": "l", "\u2098": "m",
+    "\u2099": "n", "\u209a": "p", "\u209b": "s", "\u209c": "t",
+    "\u207a": "+", "\u207b": "-", "\u208a": "+", "\u208b": "-",
+    "\u207f": "n",
+}
+_SUBSUPER_TRANS = {ord(k): v for k, v in _SUBSUPER.items()}
+
+
+def safe(text):
+    """Transliterate characters the handwriting fonts cannot draw."""
+    if text is None:
+        return text
+    text = str(text)
+    if not text:
+        return text
+    out = []
+    for ch in text:
+        cp = ord(ch)
+        if ch in "\n\t" or cp < 128:
+            out.append(ch)
+            continue
+        if _COVERAGE is not None and cp in _COVERAGE:
+            out.append(ch)
+            continue
+        rep = _ASCII_FALLBACK.get(ch)
+        if rep is not None:
+            out.append(rep)
+            continue
+        # last resort: strip accents, otherwise drop the glyph entirely
+        import unicodedata
+        dec = unicodedata.normalize("NFKD", ch)
+        if dec and all(ord(c) < 128 for c in dec):
+            out.append(dec)
+        # else: unsupported symbol -> omit rather than print a blank box
+    out = "".join(out)
+    # transliterate Unicode subscript/superscript digits & latin letters
+    if any(0x2070 <= ord(c) <= 0x209F for c in out):
+        out = out.translate(_SUBSUPER_TRANS)
+    return out
+
+
 class Pen:
     """Draws words one by one with handwriting imperfections."""
+
+
 
     def __init__(self, pdf, rng, theme):
         self.pdf = pdf
@@ -75,8 +181,12 @@ class Pen:
 
     def word(self, w, x, y, family, size, color, bold=False, rot=None):
         """Draw a single word starting at (x, y) top-left of its line box."""
-        style = "B" if bold else ""
-        self.pdf.set_font(family, style, size)
+        fam, style = family, ("B" if bold else "")
+        try:
+            self.pdf.set_font(fam, style, size)
+        except Exception:
+            # bold-alias families (handb/caveatb/note) have no "B" variant
+            self.pdf.set_font(fam, "", size)
         ang = rot if rot is not None else self.rng.uniform(
             -self.theme.get("wobble", 0.9), self.theme.get("wobble", 0.9))
         with self.pdf.rotation(ang, x, y):
@@ -85,28 +195,34 @@ class Pen:
         return self.pdf.get_string_width(w)
 
     def rich_line(self, tokens, x, y, size, base_color, kw_color, hl_terms,
-                  family="hand", bold_family="handb", line_h=None, max_w=None):
+                  family="hand", bold_family="handb", line_h=None, max_w=None,
+                  bold=False):
         pdf = self.pdf
         if line_h is None:
             line_h = size * 0.52
-        space_w = self._measure(" ", family, False, size)
+        space_w = self._measure(" ", family, bold, size)
         max_w = max_w if max_w is not None else pdf.w - pdf.r_margin - x
-        # greedy wrap (over-wide single tokens are char-split first)
+        # greedy wrap (over-wide single tokens are char-split first).
+        # keyword flag is decided HERE at wrap time so width, wrap and
+        # highlight all agree (measured in the bold font keywords render in).
         lines, cur, cur_w = [], [], 0.0
         for w in tokens:
-            ww = self._measure(w, family, False, size)
+            key = w.lower().strip(".,;:!?()[]{}\"'")
+            is_kw = bold or (bool(key in hl_terms and len(key) > 2))
+            fam = bold_family if is_kw else family
+            ww = self._measure(w, fam, is_kw, size)
             if ww > max_w:
                 if cur:
                     lines.append(cur)
                     cur, cur_w = [], 0.0
                 for piece in self._split_long(w, max_w, family, False, size):
-                    lines.append([(piece, self._measure(piece, family, False, size))])
+                    pw = self._measure(piece, family, False, size)
+                    lines.append([(piece, pw, False)])
                 continue
-            ww = ww * (1.03 if w.lower().strip(".,;:!?") in hl_terms else 1)
             if cur and cur_w + ww + space_w > max_w:
                 lines.append(cur)
                 cur, cur_w = [], 0.0
-            cur.append((w, ww))
+            cur.append((w, ww, is_kw))
             cur_w += ww + space_w
         if cur:
             lines.append(cur)
@@ -116,9 +232,7 @@ class Pen:
             bounce = self.rng.uniform(-self.theme.get("bounce", 0.5),
                                       self.theme.get("bounce", 0.5))
             xx = x
-            for w, ww in line:
-                key = w.lower().strip(".,;:!?()[]{}\"'“”‘’")
-                is_kw = key in hl_terms and len(key) > 2
+            for w, ww, is_kw in line:
                 fam = bold_family if is_kw else family
                 col = kw_color if is_kw else base_color
                 if is_kw:
@@ -143,7 +257,12 @@ class Pen:
         return pieces
 
     def _measure(self, w, family, bold, size):
-        self.pdf.set_font(family, "B" if bold else "", size)
+        try:
+            self.pdf.set_font(family, "B" if bold else "", size)
+        except Exception:
+            # bold-alias families (handb/caveatb) have no "B" variant —
+            # they are already bold, so fall back to regular style.
+            self.pdf.set_font(family, "", size)
         return self.pdf.get_string_width(w)
 
     def para(self, text, x, y, size, color, hl_terms, max_w=None, line_h=None,
@@ -159,6 +278,8 @@ class Pen:
         col = self.theme.get("highlight", (255, 235, 150))
         with self.pdf.local_context(fill_opacity=self.theme.get("highlight_opacity", 0.45)):
             self.pdf.set_fill_color(*col)
+            self.pdf.rect(x - pad_x, y - pad_y, w + 2 * pad_x, h + 2 * pad_y,
+                          "F", round_corners=True, corner_radius=1.2)
 
 def _sparkle(pdf, x, y, col, s=1.6):
     pdf.set_draw_color(*col)
@@ -480,16 +601,18 @@ class NoteDoc(FPDF):
         for b in blocks:
             kind = b[0]
             if kind == "h2":
-                self.section(b[1], b[2] if len(b) > 2 else None)
+                self.section(safe(b[1]), b[2] if len(b) > 2 else None)
             elif kind == "bullet":
-                self.bullet(b[1], level=b[2] if len(b) > 2 else 0,
+                self.bullet(safe(b[1]), level=b[2] if len(b) > 2 else 0,
                             hl_terms=b[3] if len(b) > 3 else None)
             elif kind == "para":
-                self.para(b[1], b[2] if len(b) > 2 else None)
+                self.para(safe(b[1]), b[2] if len(b) > 2 else None)
             elif kind == "key":
-                self.key(b[1], b[2], b[3] if len(b) > 3 else None)
+                self.key(safe(b[1]), safe(b[2]),
+                         b[3] if len(b) > 3 else None)
             elif kind == "arrow":
-                self.arrow_flow(b[1], b[2] if len(b) > 2 else None)
+                parts = [safe(p) for p in b[1]] if b[1] else b[1]
+                self.arrow_flow(parts, b[2] if len(b) > 2 else None)
             elif kind == "divider":
                 self.divider()
         self.divider()
@@ -497,10 +620,10 @@ class NoteDoc(FPDF):
 def build(theme_name, title, blocks, out_path, subtitle=None, cover=True, seed=None):
     """Full pipeline: theme + title + blocks -> PDF at out_path."""
     theme = load_theme(theme_name)
-    doc = NoteDoc(theme, title, seed=seed)
+    doc = NoteDoc(theme, safe(title), seed=seed)
     doc.hl_all = None
     if cover:
-        doc.cover(subtitle=subtitle)
+        doc.cover(subtitle=safe(subtitle) if subtitle else subtitle)
     else:
         doc.add_page()
         doc.set_y(28)

@@ -29,21 +29,48 @@ H1_RE = re.compile(r"^#\s+(.*)")
 H2_RE = re.compile(r"^#{2,6}\s+(.*)")
 BULLET_RE = re.compile(r"^\s*[-*•▪◦]\s+(.*)")
 NUM_RE = re.compile(r"^\s*\d+[\.\)]\s+(.*)")
-ARROW_RE = re.compile(r"\s*(->|→)\s*")
+ARROW_RE = re.compile(r"\s*(?:->|\u2192)\s*")
 KEY_RE = re.compile(r"^([A-Z][A-Za-z ,'&/-]{1,25}):\s*(.*)$")
 SHAKE_RE = re.compile(r"[*_`~]", re.M)
+DASH_RE = re.compile(r"\s*[•▪◦●○∙·|/]\s*")
+BULLET_DASH_RE = re.compile(r"\s*([•▪◦●○∙·/|])\s*")
+# contact/meta lines (emails, phones, 'LinkedIn • GitHub', locations, dates)
+# are prose context, never bullets — and never keyword-highlighted.
+META_RE = re.compile(r"(@|\+\d|www\.|http|linkedin|github|leetcode|portfolio"
+                     r"|howrah|uttar pradesh|west bengal|india"
+                     r"|^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b"
+                     r"|\b20\d\d\b)", re.I)
 
 # Private-use icon glyphs (resume icon fonts) have no handwritten-font
 # coverage -> strip them to avoid missing-glyph warnings.
 PUA_RE = re.compile("[" + chr(0xE000) + "-" + chr(0xF8FF) + "]")
+# Hyphenated line-breaks in justified resumes ('customer-' + 'focused'):
+# join 'word-' + 'continuation' directly (no space, drop the hyphen when the
+# continuation is lowercase — else keep the real compound hyphen).
+HYPHEN_JOIN_RE = re.compile(r"(\w)-\s+([A-Za-z])")
+
 # ---------------------------------------------------------------- extraction
 
 def _clean(s):
+    # icon fonts + stray symbols with no handwritten-font coverage
     s = PUA_RE.sub("", s)  # icon fonts
+    s = s.replace("▪", "").replace("◦", "").replace("•", " - ")
+    s = s.replace("●", "-").replace("◆", "-").replace("■", "-")
+    s = s.replace("⬢", "-").replace("⬣", "-")
     s = s.replace("\u2013", "-").replace("\u2014", "-").replace("\u2019", "'")
     s = s.replace("\u201c", '"').replace("\u201d", '"').replace("\u2192", "->")
     s = SHAKE_RE.sub("", s).strip()
     return re.sub(r"\s+", " ", s)
+
+def _span_gap(prev, cur):
+    """Width-aware gap between two spans; negative = overlap (kerning)."""
+    try:
+        gap = cur["bbox"][0] - prev["bbox"][2]
+        size = max(prev.get("size", 10), cur.get("size", 10))
+        return gap, (gap > -0.06 * size and gap > -0.8)
+    except Exception:
+        return 2.0, True
+
 
 def extract_from_pdf(path, use_ocr=False):
     """Return list of ('h', level, text) | ('p', text). Font size aware.
@@ -67,28 +94,25 @@ def extract_from_pdf(path, use_ocr=False):
             if b.get("type") != 0:
                 continue
             for l in b.get("lines", []):
-                spans = [s for s in l.get("spans", []) if s["text"].strip()]
-                if not spans:
+                spans = [s for s in l.get("spans", []) if s["text"]]  # keep spaces!
+                if not spans or not "".join(s["text"] for s in spans).strip():
                     continue
-                # gap-aware join: PyMuPDF splits words into per-span chunks
-                # (e.g. first/last names); naive ''.join glues them together.
-                parts, prev_x1 = [], None
+                # Gap-aware join: PyMuPDF emits per-character spans in some PDFs,
+                # including explicit ' ' spans. A space is added only when the
+                # gap is a real word break; small/negative gaps are kerning
+                # *inside* a word (e.g. Enterprise|Data with gap -3.02).
+                parts, prev = [], None
                 for s in spans:
                     t = s["text"]
-                    if parts and prev_x1 is not None and t and not t[0].isspace():
-                        try:
-                            gap = s["bbox"][0] - prev_x1
-                        except Exception:
-                            gap = 2.0
+                    if parts and prev is not None and t and not t[0].isspace():
                         tail = parts[-1][-1:] if parts[-1] else ""
-                        if gap > 0.8 and tail and not tail.isspace() \
+                        if tail and not tail.isspace() \
                                 and tail not in "-/|(" and t[0] not in ",.;:)%-/'\"":
-                            parts.append(" ")
+                            gap, is_space = _span_gap(prev, s)
+                            if is_space and gap > 0.6:
+                                parts.append(" ")
                     parts.append(t)
-                    try:
-                        prev_x1 = s["bbox"][2]
-                    except Exception:
-                        prev_x1 = None
+                    prev = s
                 txt = _clean("".join(parts))
                 if not txt:
                     continue
@@ -105,9 +129,17 @@ def extract_from_pdf(path, use_ocr=False):
         if not page_lines and use_ocr:
             scanned_pages += 1
             page_lines = _ocr_page(page)
+        page_lines = _join_hyphen_lines(page_lines)
         items.extend(page_lines)
     doc.close()
-    return items
+    # repair hyphen-joins now all pieces of a visual paragraph merged
+    fixed = []
+    for it in items:
+        if it[0] == "p":
+            fixed.append(("p", _dehyphen(it[1])))
+        else:
+            fixed.append(it)
+    return fixed
 
 
 def _ocr_page(page):
@@ -126,6 +158,43 @@ def _ocr_page(page):
     except OSError:
         pass
     return [("p", _clean(ln)) for ln in text.splitlines() if _clean(ln)]
+
+
+def _join_hyphen_lines(page_lines):
+    """Join 'word-' + 'continuation' split across visual lines of one page.
+
+    'high-impact,' + 'customer-' + 'focused' -> 'high-impact, customerfocused'
+    is still wrong alone; joining the pieces first gives 'customerfocused',
+    which _dehyphen() then repairs using the lowercase-continuation rule.
+    """
+    out = []
+    for kind, *rest in page_lines:
+        txt = rest[-1] if rest else ""
+        if out and out[-1][0] == kind == "p" and isinstance(txt, str):
+            pk, *pr = out[-1]
+            prev_txt = pr[-1] if pr else ""
+            if isinstance(prev_txt, str) and prev_txt.endswith("-") \
+                    and txt[:1].isalpha() and prev_txt[-2:-1] != " ":
+                merged = prev_txt[:-1] + txt
+                out[-1] = (pk, *pr[:-1], merged) if len(pr) > 1 else (pk, merged)
+                continue
+        out.append((kind, *rest))
+    return out
+
+
+def _dehyphen(text):
+    """Repair 'customerfocused' style joins: word- + lowercase continuation."""
+    def fix(m):
+        head, tail = m.group(1), m.group(2)
+        if len(head) >= 4 and tail[:1].islower():
+            # known compounds keep their hyphen; line-break splits drop it
+            if (head + tail).lower().startswith(
+                    ("highimpact", "objectoriented", "endtoend",
+                     "decisionmaking")):
+                return head + "-" + tail
+            return head + tail
+        return m.group(0)
+    return HYPHEN_JOIN_RE.sub(fix, text)
     doc.close()
     return items
 
@@ -141,12 +210,44 @@ def extract_text(path, use_ocr=False):
             continue
         m1, m2 = H1_RE.match(s), H2_RE.match(s)
         if m1:
-            out.append(("h", 1, _clean(m1.group(1))))
+            out.append(("h", 1, strip_md_inline(_clean(m1.group(1)))))
         elif m2:
-            out.append(("h", 2, _clean(m2.group(1))))
+            out.append(("h", 2, strip_md_inline(_clean(m2.group(1)))))
         else:
-            out.append(("p", _clean(s)))
+            s = strip_md_inline(_clean(s))
+            if not s:
+                continue
+            if re.match(r"^([-*_])\1{2,}\s*$", s):  # --- / *** separators
+                continue
+            out.append(("p", s))
     return out
+
+def strip_md_bullet(line):
+    """Remove one markdown bullet/number prefix ('- ', '* ', '1. ') only.
+
+    Indented (nested) bullets keep their marker — the renderer indents them.
+    Signs glued to a following single token may also stay, but only when the
+    sign is INSIDE the chemical token stream: '- e-' alone ('- e- carrier').
+    A full '- word ...' bullet still strips normally.
+    """
+    if re.match(r"^[+-]\s+[A-Za-z][A-Za-z0-9()]*[+-](\s|$)", line):
+        return line
+    if re.match(r"^\s+[-*\u2022]", line):
+        return line
+    return re.sub(r"^(\s*(?:[-*\u2022]|\d+[.)])\s+)", "", line)
+
+
+def strip_md_inline(text):
+    """Remove inline markdown (**bold**, *ital*, `code`, [txt](url), #tags)."""
+    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)   # images
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)    # links keep text
+    text = re.sub(r"`([^`]*)`", r"\1", text)                # code spans
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)          # bold
+    text = re.sub(r"__([^_]+)__", r"\1", text)
+    text = re.sub(r"\*([^*\n]+)\*", r"\1", text)            # italic
+    text = re.sub(r"_([^_\n]+)_", r"\1", text)
+    text = re.sub(r"~~([^~]+)~~", r"\1", text)              # strikethrough
+    return text.strip()
 
 # ---------------------------------------------------------------- keywords
 
@@ -167,8 +268,18 @@ def _classify(text):
     if m and len(m.group(2)) > 8 and m.group(1).lower() in KEYS:
         return ("key", m.group(1), m.group(2))
     if ARROW_RE.search(text) and not text.startswith(("http", "www")):
-        parts = [p.strip() for p in ARROW_RE.split(text) if p.strip()]
-        if 2 <= len(parts) <= 8 and max(len(p) for p in parts) < 28:
+        raw_parts = [p for p in ARROW_RE.split(text)]
+        parts = []
+        for p in raw_parts:
+            # only trim TRUE edge dashes: a dash with a space on its outer
+            # side was a bullet, 'e-' / 'O2-' / '-e' are chemistry — keep
+            p = re.sub(r"^[-*\u2022]\s+(?=\S)", "", p)      # leading bullet
+            p = re.sub(r"\s+$", "", p)
+            p = re.sub(r"(?<=\s)-(?=\s*$)", "", p)          # trailing stray
+            p = p.strip()
+            if p.strip(" -*\u2022"):
+                parts.append(p)
+        if 2 <= len(parts) <= 8 and all(parts) and max(len(p) for p in parts) < 28:
             return ("arrow", parts)
     return None
     for line in raw.splitlines():
@@ -216,6 +327,11 @@ def build_blocks(items):
             # resume-style leader lines ('EDUCATION -', 'SKILLS:') that sit
             # right before prose become real section heads instead of bullets
             if isinstance(text, str):
+                # nested md bullets carry their marker into text ('- '); one
+                # marker is re-added by the renderer dot, so strip it first.
+                # Signs glued to tokens (H+, e-) are not bullets — kept by
+                # strip_md_bullet itself, so no extra guard needed here.
+                text = strip_md_bullet(text)
                 nxt = items[idx + 1] if idx + 1 < len(items) else None
                 nxt_is_para = nxt is not None and nxt[0] == "p"
                 if nxt_is_para and len(text.split()) <= 6:
@@ -248,10 +364,15 @@ def build_blocks(items):
                 cls = _classify(c)
                 if cls:
                     blocks.append(cls)
-                elif len(c) < 160:
-                    blocks.append(("bullet", c, 0, copied_hl))
                 else:
-                    blocks.append(("para", c, copied_hl))
+                    full = META_RE.match(c or "") is not None or len(c.split()) <= 2 and len(c) < 60
+                    if full:
+                        hl_use = top_keywords([c]) or copied_hl  # own terms, not section bleed
+                        blocks.append(("para", c, hl_use))
+                    elif len(c) < 160:
+                        blocks.append(("bullet", c, 0, copied_hl))
+                    else:
+                        blocks.append(("para", c, copied_hl))
             elif isinstance(c, tuple):
                 blocks.append(c + (copied_hl,))
             else:
@@ -269,13 +390,23 @@ def merge_markdown(md_text):
         m1, m2 = H1_RE.match(s), H2_RE.match(s)
         mb, mn = BULLET_RE.match(s), NUM_RE.match(s)
         if m1:
-            out.append(("h", 1, _clean(m1.group(1))))
+            out.append(("h", 1, strip_md_inline(_clean(m1.group(1)))))
         elif m2:
-            out.append(("h", 2, _clean(m2.group(1))))
+            out.append(("h", 2, strip_md_inline(_clean(m2.group(1)))))
         elif mb:
-            out.append(("p", _clean(mb.group(1))))
+            out.append(("p", strip_md_inline(_clean(mb.group(1)))))
         elif mn:
-            out.append(("p", _clean(mn.group(1))))
+            out.append(("p", strip_md_inline(_clean(mn.group(1)))))
+        else:
+            s = strip_md_inline(_clean(s))
+            if not s:
+                continue
+            # markdown horizontal rules (---, ***, ___) are separators
+            if re.match(r"^([-*_])\1{2,}\s*$", s):
+                continue
+            out.append(("p", s))
+    return out
+
 # ---------------------------------------------------------------- generate
 
 def generate_notes(input_path, theme_name="sunset", out_dir=None, title=None,

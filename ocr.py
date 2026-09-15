@@ -2,6 +2,8 @@
 Importable even when rapidocr is missing; functions report availability.
 """
 
+import os
+
 _ENGINE = None
 
 
