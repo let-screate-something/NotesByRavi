@@ -508,6 +508,31 @@ with tab_edit:
             if b20.button(" Erase area", key="ed_h_er"):
                 ed.add_whiteout(e_page, h_x, h_y, h_w, h_h, erase=True)
                 st.rerun()
+
+        from whiteboard import whiteboard_panel
+
+        with st.expander("🖊 Digital board — draw & stamp", expanded=True):
+            st.caption("Write with your **pen / stylus / mouse / touch** on the "
+                       "canvas, then stamp the sheet into the PDF. "
+                       "Pressure-sensitive pens work like a normal canvas.")
+            wb_file = whiteboard_panel()
+            wb1, wb2 = st.columns([1, 1])
+            if wb1.button("📌 Stamp board as full page",
+                          key="ed_wb_stamp", disabled=not wb_file):
+                if wb_file:
+                    dst = os.path.join(UPLOAD_DIR, os.path.basename(wb_file))
+                    if dst != wb_file:
+                        open(dst, "wb").write(open(wb_file, "rb").read())
+                    ed.add_board(e_page, dst)
+                    st.rerun()
+            if wb2.button("🧽 Discard board", key="ed_wb_clear",
+                          disabled=not wb_file):
+                try:
+                    os.remove(wb_file)
+                except OSError:
+                    pass
+                st.session_state.pop("wb_file", None)
+                st.rerun()
             st.caption("Freehand — type the points in order as 'x,y' pairs.")
             pts_raw = st.text_input("Points, e.g. 60,300 80,310 100,295",
                                     key="ed_d_pts")
@@ -573,7 +598,10 @@ with tab_edit:
         if _sp and os.path.isfile(_sp):
             st.success(f"Saved {os.path.basename(_sp)}")
             if st.button("📂 Open saved PDF", key="ed_open"):
-                os.startfile(_sp)
+                if os.name == "nt":
+                    os.startfile(_sp)  # local Windows only
+                else:
+                    st.info("On Streamlit Cloud use the Download button below.")
             with open(_sp, "rb") as f:
                 st.download_button(" Download edited PDF", data=f.read(),
                                    file_name=os.path.basename(_sp),
@@ -636,7 +664,10 @@ with tab_out:
         path = os.path.join(OUT_DIR, sel)
         b1, b2, b3 = st.columns([1, 1, 1])
         if b1.button("📂 Open"):
-            os.startfile(path)
+            if os.name == "nt":
+                os.startfile(path)  # local Windows only
+            else:
+                st.info("On Streamlit Cloud use ⬇ Export → download instead.")
         if b2.button("🗑 Delete"):
             os.remove(path)
             st.rerun()

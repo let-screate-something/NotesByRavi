@@ -58,10 +58,22 @@ SYSTEM = (
 
 
 def _key_from_env():
+    # Streamlit Cloud secrets (Settings -> Secrets) are exposed as env vars
     for name in ("GROQ_API_KEY", "OPENAI_API_KEY", "AI_API_KEY"):
         val = (os.environ.get(name) or "").strip().strip("'\"")
         if val:
             return val
+    try:
+        import streamlit as _st
+        for name in ("GROQ_API_KEY", "OPENAI_API_KEY", "AI_API_KEY"):
+            try:
+                val = str(_st.secrets.get(name, "") or "").strip().strip("'\"")
+            except Exception:
+                val = ""
+            if val:
+                return val
+    except Exception:
+        pass
     return ""
 
 

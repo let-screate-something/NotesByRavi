@@ -151,6 +151,23 @@ class PDFEditor:
         self._add(page, EditLayer("highlight", x=x, y=y, w=w, h=h,
                                   color=color or (255, 235, 130)))
 
+    def add_board(self, page, img_path, x=None, y=None, w=None, h=None,
+                  full_page=True, margin=30.0):
+        """Stamp a whiteboard PNG onto the page.
+
+        full_page=True (default): centre it as a ruled board sheet inset by
+        *margin* points. Otherwise place at (x, y) with width w / height h.
+        """
+        if full_page:
+            r = self.doc[self._check(page)].rect
+            self._add(page, EditLayer("board", img=img_path, x=r.x0 + margin,
+                                      y=r.y0 + margin,
+                                      w=r.width - 2 * margin,
+                                      h=r.height - 2 * margin))
+        else:
+            self._add(page, EditLayer("board", img=img_path, x=x, y=y,
+                                      w=w, h=h))
+
     def add_whiteout(self, page, x, y, w, h, erase=False):
         self._add(page, EditLayer("whiteout", x=x, y=y, w=w, h=h, erase=erase))
 
@@ -336,6 +353,30 @@ class PDFEditor:
                 r = d.get("bw", 0.9) / 2.0
                 page.draw_circle(pts[0], r, color=_rgb(d["color"]),
                                  fill=_rgb(d["color"]))
+
+        elif k == "board":
+            path = d.get("img")
+            if not path or not os.path.isfile(path):
+                return
+            rect = fitz.Rect(d["x"], d["y"], d["x"] + d["w"], d["y"] + d["h"])
+            self._draw_board_sheet(page, rect)
+            try:
+                inset = fitz.Rect(rect.x0 + 4, rect.y0 + 4,
+                                  rect.x1 - 4, rect.y1 - 4)
+                page.insert_image(inset, filename=path, keep_proportion=True)
+            except Exception:
+                pass
+
+    def _draw_board_sheet(self, page, rect):
+        """Ruled whiteboard sheet: white fill, teal border, faint rules."""
+        page.draw_rect(rect, color=(0.18, 0.36, 0.38), fill=(1, 1, 1),
+                       width=1.1)
+        y = rect.y0 + 14
+        while y < rect.y1 - 6:
+            page.draw_line(fitz.Point(rect.x0 + 6, y),
+                           fitz.Point(rect.x1 - 6, y),
+                           color=(0.75, 0.82, 0.82), width=0.35)
+            y += 13
 
     def _composited(self):
         """A throwaway in-memory copy of the doc with all overlays applied."""
