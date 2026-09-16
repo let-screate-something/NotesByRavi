@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>pagewrite</title>
+<style>
+  * { box-sizing:border-box; }
+  body {
+    margin:0; font-family:"Segoe UI",system-ui,-apple-system,sans-serif;
+    background:#f3f5f7; color:#26313c;
+  }
+  #bar {
+    display:flex; flex-wrap:wrap; align-items:center; gap:6px;
+    padding:8px 10px; background:#fff; border-bottom:1px solid #dde4ea;
+    border-radius:10px 10px 0 0; position:sticky; top:0; z-index:5;
+  }
+  #bar button, #bar select {
+    border:1px solid #ccd6df; background:#f8fafc; color:#26313c;
+    border-radius:8px; padding:5px 10px; font-size:13px; cursor:pointer;
+  }
+  #bar button:hover { background:#eef4fa; }
+  #bar button.on { background:#dcecfb; border-color:#7fb2e5; font-weight:600; }
+  #bar button.primary { background:#1f7a4d; border-color:#1f7a4d; color:#fff; font-weight:600; }
+  #bar button.primary:hover { background:#186139; }
+  #bar button:disabled { opacity:.5; cursor:not-allowed; }
+  #bar .sep { width:1px; height:22px; background:#e2e8ee; margin:0 3px; }
+  #bar input[type=color] {
+    width:34px; height:28px; padding:0; border:1px solid #ccd6df;
+    border-radius:8px; background:#fff; cursor:pointer;
+  }
+  #bar input[type=range] { width:96px; }
+  #sz { font-size:12px; color:#5d6b78; min-width:16px; }
+  #status { font-size:12px; color:#5d6b78; margin-left:auto; }
+  #stage { padding:12px; height:660px; overflow:auto; }
+  #holder {
+    position:relative; margin:0 auto; max-width:900px;
+    box-shadow:0 3px 16px rgba(30,50,70,.20); border-radius:6px; background:#fff;
+  }
+  #bg { display:block; width:100%; height:auto; border-radius:6px; }
+  #ink {
+    position:absolute; left:0; top:0; width:100%; height:100%;
+    touch-action:none; cursor:crosshair; border-radius:6px;
+    mix-blend-mode:multiply;
+  }
+  #navbtns { position:absolute; right:8px; bottom:8px; display:flex; gap:6px; }
+  #navbtns button {
+    width:34px; height:34px; border-radius:50%; border:1px solid #ccd6df;
+    background:rgba(255,255,255,.92); font-size:16px; line-height:1; cursor:pointer;
+  }
+  #navbtns button:hover { background:#eef4fa; }
+  #navbtns select {
+    height:34px; max-width:120px; border-radius:8px; border:1px solid #ccd6df;
+    background:rgba(255,255,255,.92); color:#26313c; font-size:13px; padding:0 4px;
+  }
+  #navbtns button:disabled { opacity:.45; cursor:not-allowed; }
+  #hint { font-size:12px; color:#71828f; padding:8px 14px 4px; text-align:center; }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <button class="tool on" data-tool="pen">✏️ Pen</button>
+    <button class="tool" data-tool="marker">🖍 Marker</button>
+    <button class="tool" data-tool="hl">🖌 Highlighter</button>
+    <button class="tool" data-tool="eraser">🧽 Eraser</button>
+    <span class="sep"></span>
+    <input type="color" id="color" value="#20242e" title="Ink colour">
+    <input type="range" id="size" min="1" max="30" value="3" title="Stroke width">
+    <span id="sz">3</span>
+    <span class="sep"></span>
+    <button id="undo" disabled>↶ Undo</button>
+    <button id="clear" disabled>🗑 Clear</button>
+    <span class="sep"></span>
+    <button id="apply" class="primary" disabled>✅ Apply to PDF</button>
+    <span id="status">Loading page…</span>
+  </div>
+  <div id="stage">
+    <div id="holder">
+      <img id="bg" alt="PDF page">
+      <canvas id="ink"></canvas>
+      <div id="navbtns">
+        <button id="prev" title="Previous page">&#8249;</button>
+        <select id="pgsel" title="Go to page"></select>
+        <button id="next" title="Next page">&#8250;</button>
+      </div>
+    </div>
+    <div id="hint">Pen / stylus / touch / mouse · pressure changes stroke width ·
+      <b>Apply</b> stamps your ink onto the real page at print resolution.</div>
+  </div>
+  <script>
+  /* ---------- Streamlit component protocol (static, no build step) ---------- */
+  var SEQ = 0;
+  function post(type, extra) {
+    var payload = Object.assign({ isStreamlitMessage: true, type: type }, extra || {});
+    window.parent.postMessage(payload, "*");
+  }
+  function sendReady() { post("streamlit:componentReady", { apiVersion: 1 }); }
+  function setHeight(h) { post("streamlit:setFrameHeight", { height: h }); }
+  function setValue(value, dataType) {
+    post("streamlit:setComponentValue", { value: value, dataType: dataType || "json" });
+  }
+  function setStatus(msg) { document.getElementById("status").textContent = msg; }
+  sendReady();
+  </script>
+
+  <script>
+  /* ---------- drawing engine ---------- */
+  var S = { page: 0, pages: 1, pw: 595, ph: 842, token: null };
+  var ALPHA = { pen: 1.0, marker: 0.85, hl: 0.32, eraser: 1.0 };
+  var strokes = [];
+  var current = null;
+  var tool = "pen", color = "#20242e", size = 3;
+  var dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+
+  var bgEl = document.getElementById("bg");
+  var cvEl = document.getElementById("ink");
+  var ctx = cvEl.getContext("2d");
+  var btnUndo = document.getElementById("undo");
+  var btnClear = document.getElementById("clear");
+  var btnApply = document.getElementById("apply");
+  var btnPrev = document.getElementById("prev");
+  var btnNext = document.getElementById("next");
+
+  /* ---- toolbar ---- */
+  var toolBtns = document.querySelectorAll("#bar .tool");
+  for (var i = 0; i < toolBtns.length; i++) {
+    (function (b) {
+      b.addEventListener("click", function () {
+        tool = b.getAttribute("data-tool");
+        for (var k = 0; k < toolBtns.length; k++) toolBtns[k].classList.remove("on");
+        b.classList.add("on");
+        setStatus(tool + " selected");
+      });
+    })(toolBtns[i]);
+  }
+  document.getElementById("color").addEventListener("input", function (e) { color = e.target.value; });
+  document.getElementById("size").addEventListener("input", function (e) {
+    size = parseInt(e.target.value, 10) || 1;
+    document.getElementById("sz").textContent = size;
+  });
+  btnUndo.addEventListener("click", function () {
+    strokes.pop();
+    redraw(true);
+    setStatus(strokes.length + " stroke(s)");
+  });
+  btnClear.addEventListener("click", function () {
+    strokes = [];
+    redraw(true);
+    setStatus("cleared");
+  });
+  btnApply.addEventListener("click", apply);
+  btnPrev.addEventListener("click", function () { nav(-1); });
+  btnNext.addEventListener("click", function () { nav(1); });
+  var selEl = document.getElementById("pgsel");
+  selEl.addEventListener("change", function (e) {
+    var t = parseInt(e.target.value, 10);
+    if (isNaN(t) || t === S.page) return;
+    setValue(JSON.stringify({ action: "nav", page: t, seq: ++SEQ }), "json");
+    setStatus("loading page " + (t + 1) + "\u2026");
+  });
+
+  function pageList() {
+    return (S.plist && S.plist.length) ? S.plist : [S.page];
+  }
+
+  function fillPages() {
+    var list = pageList();
+    var pos = list.indexOf(S.page);
+    if (pos < 0) { pos = 0; }
+    selEl.innerHTML = "";
+    for (var i = 0; i < list.length; i++) {
+      var o = document.createElement("option");
+      o.value = String(list[i]);
+      o.textContent = "Page " + (list[i] + 1);
+      selEl.appendChild(o);
+    }
+    selEl.selectedIndex = pos;
+    btnPrev.disabled = pos <= 0;
+    btnNext.disabled = pos >= list.length - 1;
+  }
+
+  function nav(d) {
+    var list = pageList();
+    var pos = list.indexOf(S.page);
+    var t = pos + d;
+    if (t < 0 || t >= list.length) return;
+    setValue(JSON.stringify({ action: "nav", page: list[t], seq: ++SEQ }), "json");
+    setStatus("loading page " + (list[t] + 1) + "\u2026");
+  }
+
+  function updateButtons() {
+    btnUndo.disabled = strokes.length === 0;
+    btnClear.disabled = strokes.length === 0;
+    btnApply.disabled = strokes.length === 0;
+    fillPages();
+  }
+
+  /* ---- sizing ---- */
+  function fitCanvas() {
+    var r = cvEl.getBoundingClientRect();
+    var w = Math.max(240, Math.round(r.width));
+    var h = Math.max(240, Math.round(r.height));
+    if (cvEl.width === Math.round(w * dpr) && cvEl.height === Math.round(h * dpr)) return;
+    cvEl.width = Math.round(w * dpr);
+    cvEl.height = Math.round(h * dpr);
+    redraw(false);
+  }
+
+  /* ---- rendering (normalised coords => survives resize) ---- */
+  function drawStroke(st, g, W, H) {
+    var pts = st.pts;
+    if (!pts || !pts.length) return;
+    var w = Math.max(0.5, st.w * W);
+    g.globalCompositeOperation = st.tool === "eraser" ? "destination-out" : "source-over";
+    g.globalAlpha = st.alpha;
+    g.strokeStyle = st.color;
+    g.fillStyle = st.color;
+    g.lineJoin = "round";
+    g.lineCap = "round";
+    if (pts.length === 1) {
+      g.beginPath();
+      g.arc(pts[0].x * W, pts[0].y * H, Math.max(0.4, w / 2), 0, Math.PI * 2);
+      g.fill();
+    } else if (st.tool === "pen") {
+      for (var i = 1; i < pts.length; i++) {
+        var a = pts[i - 1], b = pts[i];
+        g.beginPath();
+        g.lineWidth = Math.max(0.5, w * (0.6 + 0.85 * (b.p == null ? 0.5 : b.p)));
+        g.moveTo(a.x * W, a.y * H);
+        g.lineTo(b.x * W, b.y * H);
+        g.stroke();
+      }
+    } else {
+      g.beginPath();
+      g.lineWidth = w;
+      g.moveTo(pts[0].x * W, pts[0].y * H);
+      for (var j = 1; j < pts.length; j++) g.lineTo(pts[j].x * W, pts[j].y * H);
+      g.stroke();
+    }
+    g.globalAlpha = 1;
+    g.globalCompositeOperation = "source-over";
+  }
+
+  function redraw(withStatus) {
+    var W = cvEl.width / dpr, H = cvEl.height / dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    for (var i = 0; i < strokes.length; i++) drawStroke(strokes[i], ctx, W, H);
+    if (current) drawStroke(current, ctx, W, H);
+    updateButtons();
+    return withStatus;
+  }
+
+  /* last segment only — cheap live feedback while the pointer is down */
+  function drawTail(st) {
+    var W = cvEl.width / dpr, H = cvEl.height / dpr;
+    var n = st.pts.length;
+    if (n < 2) { drawStroke(st, ctx, W, H); return; }
+    drawStroke({ tool: st.tool, color: st.color, alpha: st.alpha, w: st.w,
+                 pts: st.pts.slice(n - 2, n) }, ctx, W, H);
+  }
+  /* ---- pointer input (pen / stylus / touch / mouse) ---- */
+  function evtPoint(e) {
+    var r = cvEl.getBoundingClientRect();
+    var p = 0.5;
+    if (e.pressure && e.pressure > 0 && e.pointerType !== "mouse") p = e.pressure;
+    return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height, p: p };
+  }
+
+  cvEl.addEventListener("pointerdown", function (e) {
+    if (!cvEl.width) return;
+    e.preventDefault();
+    try { cvEl.setPointerCapture(e.pointerId); } catch (err) { }
+    current = {
+      tool: tool, color: color, alpha: ALPHA[tool],
+      w: size / Math.max(1, cvEl.width / dpr),
+      pts: [evtPoint(e)]
+    };
+    drawTail(current);
+  });
+
+  cvEl.addEventListener("pointermove", function (e) {
+    if (!current) return;
+    e.preventDefault();
+    var p = evtPoint(e);
+    var last = current.pts[current.pts.length - 1];
+    if (Math.abs(p.x - last.x) < 0.0006 && Math.abs(p.y - last.y) < 0.0006) return;
+    current.pts.push(p);
+    drawTail(current);
+  });
+
+  function finish(e) {
+    if (!current) return;
+    try { cvEl.releasePointerCapture(e.pointerId); } catch (err) { }
+    strokes.push(current);
+    current = null;
+    redraw(false);
+    setStatus(strokes.length + " stroke(s) — press Apply to write onto the page");
+  }
+  cvEl.addEventListener("pointerup", finish);
+  cvEl.addEventListener("pointercancel", finish);
+  cvEl.addEventListener("pointerleave", function (e) { if (current) finish(e); });
+  window.addEventListener("contextmenu", function (e) {
+    if (e.target === cvEl) e.preventDefault();
+  });
+  window.addEventListener("resize", function () { fitCanvas(); });
+
+  /* ---- apply: transparent ink overlay -> Python ---- */
+  function hasInk() {
+    try {
+      var d = ctx.getImageData(0, 0, cvEl.width, cvEl.height).data;
+      for (var i = 3; i < d.length; i += 20) { if (d[i] > 8) return true; }
+    } catch (err) { }
+    return false;
+  }
+
+  function apply() {
+    if (!strokes.length) { setStatus("nothing drawn yet"); return; }
+    if (!hasInk()) { setStatus("nothing drawn yet"); return; }
+    var pxPerPt = Math.min(4, 2800 / Math.max(S.pw, S.ph));
+    var tw = Math.round(S.pw * pxPerPt), th = Math.round(S.ph * pxPerPt);
+    var out = document.createElement("canvas");
+    out.width = tw; out.height = th;
+    var g = out.getContext("2d");
+    g.imageSmoothingEnabled = true;
+    if (g.imageSmoothingQuality) g.imageSmoothingQuality = "high";
+    g.drawImage(cvEl, 0, 0, tw, th);
+    setValue(JSON.stringify({
+      action: "ink", png: out.toDataURL("image/png"), page: S.page,
+      pw: S.pw, ph: S.ph, sx: tw / S.pw, sy: th / S.ph,
+      strokes: strokes.length, seq: ++SEQ
+    }), "json");
+    setStatus("✔ sent to PDF — " + strokes.length + " stroke(s) at " + tw + "×" + th + "px");
+  }
+
+  /* ---- Streamlit render message ---- */
+  window.addEventListener("message", function (ev) {
+    var d = ev.data;
+    if (!d || d.type !== "streamlit:render") return;
+    var a = d.args || {};
+    S.pw = parseFloat(a.pw) || 595;
+    S.ph = parseFloat(a.ph) || 842;
+    S.page = parseInt(a.page, 10) || 0;
+    S.plist = (Array.isArray(a.pages) && a.pages.length)
+      ? a.pages.map(function (n) { return parseInt(n, 10) || 0; })
+      : [S.page];
+    var newToken = String(a.token);
+    var changed = (newToken !== S.token);
+    S.token = newToken;
+    setHeight(768);
+    if (a.bg) {
+      bgEl.onload = function () {
+        fitCanvas();
+        if (changed) { strokes = []; redraw(false); }
+        updateButtons();
+        if (changed) setStatus("Ready \u00b7 page " + (S.page + 1) + " of " + pageList().length);
+      };
+      bgEl.src = a.bg;
+    }
+  });
+  </script>
+</body>
+</html>

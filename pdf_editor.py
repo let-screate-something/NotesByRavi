@@ -25,13 +25,26 @@ import os
 
 import fitz  # PyMuPDF
 
-import renderer
-
 BASE = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(BASE, "output")
 NOTES_DIR = os.path.join(BASE, "notes")
+WORK_DIR = os.path.join(BASE, "output", "_work")
+UPLOAD_DIR = os.path.join(BASE, "output", "_uploads")
 
-# friendly label -> renderer font key
+for _d in (OUT_DIR, WORK_DIR, UPLOAD_DIR):
+    try:
+        os.makedirs(_d, exist_ok=True)
+    except OSError:
+        pass
+
+# friendly label -> bundled handwriting font file
+_FONT_FILES = {
+    "hand": os.path.join(BASE, "assets", "fonts", "PatrickHand-Regular.ttf"),
+    "handb": os.path.join(BASE, "assets", "fonts", "Kalam-Bold.ttf"),
+    "note": os.path.join(BASE, "assets", "fonts", "Kalam-Regular.ttf"),
+    "caveat": os.path.join(BASE, "assets", "fonts", "Caveat-Regular-static.ttf"),
+    "caveatb": os.path.join(BASE, "assets", "fonts", "Caveat-Bold-static.ttf"),
+}
 FONT_CHOICES = {
     "hand (Patrick Hand)": "hand",
     "note (Kalam)": "note",
@@ -55,15 +68,17 @@ def _rgb(c):
 
 
 def _font(name):
-    """Return a fitz.Font for a renderer font key, with safe fallbacks."""
-    path = renderer.FONT_FILES.get(name) or renderer.FONT_FILES.get("hand")
+    """Return a fitz.Font for a bundled handwriting font, with fallbacks."""
+    path = _FONT_FILES.get(name) or _FONT_FILES.get("hand")
     try:
-        return fitz.Font(fontfile=path)
+        if path and os.path.isfile(path):
+            return fitz.Font(fontfile=path)
     except Exception:
-        try:
-            return fitz.Font("helv")
-        except Exception:
-            return fitz.Font()
+        pass
+    try:
+        return fitz.Font("helv")
+    except Exception:
+        return fitz.Font()
 
 
 def _wrap(text, width, max_lines):
@@ -168,6 +183,16 @@ class PDFEditor:
             self._add(page, EditLayer("board", img=img_path, x=x, y=y,
                                       w=w, h=h))
 
+    def add_page_ink(self, page, img_path, sx=1.0, sy=1.0):
+        """Stamp a transparent whole-page ink overlay (pagewrite canvas).
+
+        The canvas is W px wide for a page Pw pt wide; strokes land at
+        (x*sx, y*sy) in PDF points exactly where the user drew them.
+        """
+        r = self.doc[self._check(page)].rect
+        self._add(page, EditLayer("pageink", img=img_path, sx=sx, sy=sy,
+                                  pw=r.width, ph=r.height))
+
     def add_whiteout(self, page, x, y, w, h, erase=False):
         self._add(page, EditLayer("whiteout", x=x, y=y, w=w, h=h, erase=erase))
 
@@ -192,7 +217,7 @@ class PDFEditor:
         self.page_count = self.doc.page_count
 
     def move_page(self, page, to_page):
-        idx, to = self._check(page) - 1, self._check(to_page) - 1
+        idx, to = self._check(page), self._check(to_page)
         if idx == to:
             return
         self.undo_stack.append(("move", idx, to))
@@ -202,8 +227,17 @@ class PDFEditor:
 
     def duplicate_page(self, page):
         idx = self._check(page)
-        self.doc.fullcopy_page(idx, idx + 1)
-        self.layers.insert(idx + 1, [])
+        if idx + 1 < self.page_count:
+            self.doc.fullcopy_page(idx, idx + 1)
+            self.layers.insert(idx + 1, [])
+        else:
+            # duplicating the LAST page: fullcopy needs an existing target,
+            # so copy before page 0 and then move the copy to the end.
+            self.doc.fullcopy_page(idx, 0)
+            self.layers.insert(0, [])
+            self.doc.move_page(0, -1)  # -1 = after the last page
+            layer = self.layers.pop(0)
+            self.layers.append(layer)
         self.page_count = self.doc.page_count
         self.undo_stack.append(("duplicate", idx))
 
@@ -364,6 +398,20 @@ class PDFEditor:
                 inset = fitz.Rect(rect.x0 + 4, rect.y0 + 4,
                                   rect.x1 - 4, rect.y1 - 4)
                 page.insert_image(inset, filename=path, keep_proportion=True)
+            except Exception:
+                pass
+
+        elif k == "pageink":
+            # Transparent whole-page overlay: it MUST cover the page rect
+            # exactly in PDF points, otherwise strokes drift. im is the
+            # canvas bitmap (cw x ch px); it maps 1:1 onto page.rect via
+            # the canvas scale, so a direct full-rect insert is exact.
+            path = d.get("img")
+            if not path or not os.path.isfile(path):
+                return
+            try:
+                page.insert_image(page.rect, filename=path,
+                                  overlay=True, keep_proportion=False)
             except Exception:
                 pass
 

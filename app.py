@@ -1,77 +1,63 @@
-"""Notes Studio — beautiful handwritten-style notes from PDFs, files or AI prompts.
+"""PDF Write Studio — open any PDF and write directly ON the page.
+
+Every edit is a true vector overlay drawn natively by PyMuPDF (no
+rasterising of the original content), so text stays sharp at any zoom and
+the source PDF on disk is never touched until you press Save.
+
+The centrepiece is a whole-page writeable canvas (the `pagewrite` custom
+component): the real page is the canvas background, so a digital pen /
+stylus / touch / mouse writes straight onto the document, pressure-aware.
 Run:  streamlit run app.py
 """
 
-import glob
-import json
 import os
 import time
 
-import fitz
 import streamlit as st
 
-import ai_notes
-import export
-import pdf_editor
-import research
-from make_notes import build_blocks, extract_text, generate_notes
-from renderer import list_themes, load_theme
-from ocr import ocr_available
+import pagewrite
+from pdf_editor import FONT_CHOICES, INK, STICKY_COLORS, PDFEditor, \
+    list_editable_pdfs
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-NOTES_DIR = os.path.join(BASE, "notes")
 OUT_DIR = os.path.join(BASE, "output")
-THEMES_FILE = os.path.join(BASE, "themes.json")
-HISTORY_FILE = os.path.join(OUT_DIR, "history.json")
-UPLOAD_DIR = os.path.join(OUT_DIR, "_uploads")
-os.makedirs(NOTES_DIR, exist_ok=True)
+UPLOAD_DIR = os.path.join(BASE, "output", "_uploads")
 os.makedirs(OUT_DIR, exist_ok=True)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-PRESET_NAMES = {
-    "Study guide": "study_guide",
-    "Cheat sheet": "cheat_sheet",
-    "Exam prep": "exam_prep",
-    "Flashcards": "flashcards",
-}
-PRESET_HELP = {
-    "Study guide": "Balanced notes with definitions & tips",
-    "Cheat sheet": "Ultra-dense one-page cheat sheet",
-    "Exam prep": "What to remember + common mistakes",
-    "Flashcards": "Q&A cards (exportable to Anki)",
-}
-
-st.set_page_config(page_title="Notes Studio", page_icon="🎨", layout="wide")
+st.set_page_config(page_title="PDF Write Studio", page_icon="🖋", layout="wide")
 
 st.markdown("""
 <style>
     .stApp {
-        background: linear-gradient(160deg, #FDFCF8 0%, #EAF4F2 45%, #F6EFF8 100%);
+        background: linear-gradient(160deg, #FDFCF8 0%, #EAF2F4 45%, #F5EFF8 100%);
         color: #2E3D48 !important;
     }
-    .stApp, .stApp p, .stApp span, .stApp label, .stApp li, .stApp td, .stApp div {
+    .stApp, .stApp p, .stApp span, .stApp label, .stApp li, .stApp div {
         color: #2E3D48;
     }
-    .stApp h1, .stApp h2, .stApp h3, .stApp h4 { color: #35505E !important; }
+    .stApp h1, .stApp h2, .stApp h3, .stApp h4 { color: #33525E !important; }
     .stApp header { background: transparent; }
     .block-container {
-        background: rgba(255, 255, 255, 0.72); border-radius: 18px;
-        padding: 2rem 2.4rem 3rem 2.4rem; margin-top: 1rem;
+        background: rgba(255, 255, 255, 0.74); border-radius: 18px;
+        padding: 1.6rem 2.2rem 3rem 2.2rem; margin-top: .8rem;
     }
     section[data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #F6FAF8 0%, #EDF3F8 100%);
+        background: linear-gradient(180deg, #F7FAF9 0%, #EDF2F8 100%);
         border-right: 1px solid #E2E8EE;
     }
     section[data-testid="stSidebar"] * { color: #2E3D48; }
     .stApp textarea, .stApp input, div[data-baseweb="select"] > div,
     .stApp [data-testid="stFileUploaderDropzone"] {
-        background-color: #FFFFFF !important; color: #2E3D48 !important; border-radius: 10px;
+        background-color: #FFFFFF !important; color: #2E3D48 !important;
+        border-radius: 10px;
     }
     .stApp textarea::placeholder, .stApp input::placeholder { color: #7C8B96 !important; }
     div.stButton > button {
-        border-radius: 12px !important; border: 1px solid #C9DDE2 !important; color: #2F4858 !important;
-        background: linear-gradient(135deg, #D6ECE9, #E3EBFB) !important;
-        font-weight: 600; padding: 0.45em 1.2em;
+        border-radius: 12px !important; border: 1px solid #C9DDE2 !important;
+        color: #2F4858 !important;
+        background: linear-gradient(135deg, #D9EDE9, #E3EBFB) !important;
+        font-weight: 600; padding: 0.4em 1.1em;
     }
     .stApp [data-baseweb="tab"] p { color: #5A6B78; }
     .stApp [aria-selected="true"] p { color: #2F4858 !important; font-weight: 700; }
@@ -82,606 +68,342 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-def show_pdf(path, dpi=100):
-    doc = fitz.open(path)
-    n = doc.page_count
-    if n == 1:
-        st.image(doc[0].get_pixmap(dpi=dpi).tobytes("png"), width="stretch")
-    else:
-        pages = st.tabs([f"Page {i + 1}" for i in range(n)])
-        for i, tab in enumerate(pages):
-            with tab:
-                st.image(doc[i].get_pixmap(dpi=dpi).tobytes("png"), width="stretch")
-    doc.close()
+# ---- small helpers ---------------------------------------------------------
+
+def hex_rgb(h):
+    """'#rrggbb' -> (r, g, b) tuple, falling back to the default ink."""
+    h = (h or "#20242e").lstrip("#")
+    if len(h) != 6:
+        return INK
+    try:
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return INK
 
 
-def outputs_list():
-    return sorted(glob.glob(os.path.join(OUT_DIR, "*.pdf")),
-                  key=os.path.getmtime, reverse=True)
+def bump():
+    """New canvas token -> client clears its strokes (fresh surface)."""
+    st.session_state.token = os.urandom(4).hex()
 
 
-def log_history(record):
-    hist = []
-    if os.path.isfile(HISTORY_FILE):
-        try:
-            hist = json.load(open(HISTORY_FILE, encoding="utf-8"))
-        except Exception:
-            hist = []
-    hist.insert(0, record)
-    json.dump(hist[:200], open(HISTORY_FILE, "w", encoding="utf-8"), indent=1)
+def open_pdf(path, name):
+    """(Re)create the editor session for a chosen PDF."""
+    st.session_state.ed = PDFEditor(path)
+    st.session_state.src_name = name
+    st.session_state.page = 1
+    st.session_state.pw_seq = -1
+    st.session_state.last_saved = None
+    bump()
 
 
-def _hex_rgb(hexv):
-    """'#rrggbb' -> (r, g, b) ints."""
-    hexv = (hexv or "#000000").lstrip("#")
-    return tuple(int(hexv[i:i + 2], 16) for i in (0, 2, 4))
+def get_ed():
+    return st.session_state.get("ed")
 
 
-def render(items, theme, title=None, subtitle=None, cover=True):
-    doc_title, blocks = build_blocks(items)
-    if title:
-        doc_title = title
-    os.makedirs(OUT_DIR, exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    out_path = os.path.join(OUT_DIR, f"note_{ts}_{theme}.pdf")
-    load_theme(theme)  # early, clear failure
-    import renderer as _r
-    _r.build(theme, doc_title, blocks, out_path, subtitle=subtitle, cover=cover)
-    return out_path, doc_title, len(blocks)
-# ------------------------------------------------------------------ sidebar
-st.sidebar.title("🎨 Notes Studio")
-theme = st.sidebar.selectbox("Theme", list_themes(), index=0)
-st.sidebar.caption("Pick the color mood for your notes.")
+# ---- sidebar ---------------------------------------------------------------
 
-cfg = ai_notes.load_config()
-with st.sidebar.expander("🤖 AI Settings", expanded=not ai_notes.ai_ready(cfg)):
-    st.caption("OpenAI, Groq, OpenRouter…\nor free local Ollama:\nbase http://localhost:11434/v1")
-    new_key = st.text_input("API key", value=cfg["api_key"], type="password")
-    new_base = st.text_input("Base URL", value=cfg["base_url"])
-    new_model = st.text_input("Model", value=cfg["model"])
-    if st.button("💾 Save AI settings"):
-        cfg.update(api_key=new_key.strip(), base_url=new_base.strip(), model=new_model.strip())
-        ai_notes.save_config(cfg)
-        st.success("Saved!")
-    st.caption("✅ AI ready" if ai_notes.ai_ready(cfg) else "⚠️ AI not configured — "
-               "File & Batch tabs work offline; Prompt falls back to simple layout.")
+with st.sidebar:
+    st.title("🖋 PDF Write Studio")
 
-with st.sidebar.expander("🎨 Theme Studio", expanded=False):
-    raw = json.load(open(THEMES_FILE, encoding="utf-8"))
-    pick = st.selectbox("Edit theme", list(raw.keys()))
-    cols = ["paper", "title_band", "title_text", "heading1", "body",
-            "bullet", "highlight", "callout_bg", "accent"]
-    changed = {}
-    for k in cols:
-        cur = raw[pick].get(k)
-        if isinstance(cur, list) and len(cur) == 3:
-            hexv = "#%02x%02x%02x" % tuple(cur)
-        else:
-            hexv = "#ffffff"
-        val = st.color_picker(k, hexv)
-        changed[k] = tuple(int(val.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
-    if st.button("Save this theme"):
-        raw[pick].update(changed)
-        json.dump(raw, open(THEMES_FILE, "w", encoding="utf-8"), indent=2)
-        st.success(f"'{pick}' updated!")
+    st.subheader("1 · Open a PDF")
+    up = st.file_uploader("Upload a PDF", type=["pdf"])
+    if up is not None and up.name != st.session_state.get("up_name"):
+        dest = os.path.join(UPLOAD_DIR, up.name)
+        with open(dest, "wb") as f:
+            f.write(up.getvalue())
+        st.session_state.up_name = up.name
+        open_pdf(dest, up.name)
 
-SAMPLE_PROMPTS = [
-    "Explain photosynthesis with definitions and a memory tip",
-    "Revision notes on the French Revolution: causes, events, dates",
-    "Cheat sheet for Statistics: mean median mode, variance, distributions",
-    "Notes on Java classes, inheritance and polymorphism with examples",
-]
+    files = list_editable_pdfs()
+    names = [os.path.basename(p) for p in files]
+    sel = st.selectbox("…or open a local one", ["—"] + names, index=0)
+    if sel != "—" and sel != st.session_state.get("src_name"):
+        open_pdf(files[names.index(sel)], sel)
 
-tab_res, tab_file, tab_edit, tab_ai, tab_batch, tab_out = st.tabs([
-    "🔎 1· Research → Markdown",
-    "📄 2· Markdown/File → PDF",
-    "✏️ 3· Edit PDF",
-    "✨ From Prompt",
-    "📚 Batch Folder",
-    "🗂 My Notes"])
+    ed = get_ed()
+    if ed is None:
+        st.info("Open a PDF to start writing on it.")
+        st.stop()
 
-with tab_res:
-    st.subheader("🔎 Research a topic or your PDFs → clean Markdown")
-    st.caption("Combines a topic description, PDFs, text files and web pages "
-               "into one structured .md file. That .md then feeds tab 2.")
+    st.caption(f"📄 {st.session_state.src_name} — {ed.page_count} page(s)")
 
-    r_topic = st.text_area(
-        "Topic / description", height=90, key="res_topic",
-        placeholder="e.g. Descriptive statistics — central tendency, dispersion, "
-                    "skewness. Focus on formulas and when to use each measure.")
+    st.subheader("2 · Page")
+    nav1, nav2, nav3 = st.columns([1, 2, 1])
+    if nav1.button("◀") and st.session_state.page > 1:
+        st.session_state.page -= 1
+        bump()
+    page_pick = nav2.number_input("Go to page", min_value=1,
+                                  max_value=max(1, ed.page_count),
+                                  value=st.session_state.page, key="pg_pick")
+    if page_pick != st.session_state.page:
+        st.session_state.page = int(page_pick)
+        bump()
+    if nav3.button("▶") and st.session_state.page < ed.page_count:
+        st.session_state.page += 1
+        bump()
 
-    c_r1, c_r2 = st.columns(2)
-    with c_r1:
-        r_pdfs = st.file_uploader("Reference PDFs (optional)", type=["pdf"],
-                                  accept_multiple_files=True, key="res_pdfs")
-        r_docs = st.file_uploader("Reference TXT / MD (optional)",
-                                  type=["txt", "md"], accept_multiple_files=True,
-                                  key="res_txt")
-    with c_r2:
-        _np = sorted(glob.glob(os.path.join(NOTES_DIR, "*.pdf")))
-        r_pick_pdf = st.multiselect("…or pick PDFs already in notes/",
-                                    [os.path.basename(p) for p in _np],
-                                    key="res_pick_pdf")
-        r_urls = st.text_area("Web pages (one per line, optional)", height=68,
-                              key="res_urls",
-                              placeholder="https://en.wikipedia.org/wiki/Statistics")
+    total_layers = sum(len(l) for l in ed.layers)
+    st.caption(f"✍️ {len(ed.layers[st.session_state.page - 1])} ink/object(s) "
+               f"on this page · {total_layers} total")
 
-    c_s1, c_s2 = st.columns([1, 2])
-    r_style = c_s1.selectbox("Research style",
-                             ["study_guide", "bullet_summary", "deep_dive"],
-                             key="res_style")
-    r_extra = c_s2.text_input("Extra instructions (optional)", key="res_extra",
-                              placeholder="e.g. keep every formula, add exam tips")
-
-    if st.button("🔎 Research & Build Markdown", type="primary"):
-        pdf_paths, txt_paths = [], []
-        for uf in (r_pdfs or []):
-            dst = os.path.join(UPLOAD_DIR, uf.name)
-            with open(dst, "wb") as f:
-                f.write(uf.getvalue())
-            pdf_paths.append(dst)
-        for uf in (r_docs or []):
-            dst = os.path.join(UPLOAD_DIR, uf.name)
-            with open(dst, "wb") as f:
-                f.write(uf.getvalue())
-            txt_paths.append(dst)
-        pdf_paths += [os.path.join(NOTES_DIR, n) for n in r_pick_pdf]
-        url_list = [u.strip() for u in (r_urls or "").splitlines() if u.strip()]
-        if not (r_topic.strip() or pdf_paths or txt_paths or url_list):
-            st.warning("Give me something to research — a topic, a PDF, a file "
-                       "or a URL.")
-        else:
-            try:
-                with st.spinner("Gathering sources and compiling markdown…"):
-                    md = research.research_to_markdown(
-                        r_topic, pdf_files=pdf_paths, txt_files=txt_paths,
-                        urls=url_list, style=r_style,
-                        extra_instructions=r_extra, cfg=cfg)
-                st.session_state["res_md"] = md
-                st.session_state["res_name"] = (
-                    (r_topic.strip()[:40] or "research")
-                    .replace("/", "-").replace("\\", "-").strip() + ".md")
-                log_history({"time": time.strftime("%Y-%m-%d %H:%M"),
-                             "source": "Research",
-                             "title": (r_topic.strip()[:40] or "notes"),
-                             "theme": "-", "pages": 0})
-            except Exception as e:
-                st.error(f"Research failed: {e}")
-
-    if st.session_state.get("res_md"):
-        st.success("Markdown ready — edit it below, then save it into notes/.")
-        edited_md = st.text_area("Markdown (editable)",
-                                 value=st.session_state["res_md"], height=320)
-        fname = st.text_input("File name",
-                              value=st.session_state.get("res_name", "notes.md"))
-        b1, b2 = st.columns(2)
-        if b1.button("💾 Save to notes/"):
-            name = fname if fname.lower().endswith(".md") else fname + ".md"
-            p = research.save_markdown(edited_md, name, NOTES_DIR)
-            st.success(f"Saved {os.path.basename(p)} — now open tab 2 and pick it.")
-        b2.download_button(" Download .md", data=edited_md, file_name=fname,
-                           mime="text/markdown")
-with tab_ai:
-    st.subheader("Describe the notes you want")
-    preset_label = st.radio("Style", list(PRESET_NAMES), horizontal=True,
-                            help=" | ".join(PRESET_HELP.values()))
-    prompt = st.text_area(
-        "Prompt", height=110, label_visibility="collapsed",
-        placeholder="e.g. Make revision notes on the French Revolution: causes, "
-                    "key events and important dates.")
-    with st.popover("💡 Try a sample prompt"):
-        for s in SAMPLE_PROMPTS:
-            if st.button(s):
-                prompt = s
-    c1, c2 = st.columns([1, 3])
-    if c2.button("✨ Generate Notes"):
-        if not prompt.strip():
-            st.warning("Type a prompt first!")
-        else:
-            try:
-                if ai_notes.ai_ready(cfg):
-                    with st.spinner("AI is writing your notes (multi-pass)..."):
-                        doc = ai_notes.ai_generate_notes(prompt, PRESET_NAMES[preset_label], cfg)
-                        items = ai_notes.doc_to_items(doc)
-                else:
-                    st.info("AI not configured — simple layout from your prompt. "
-                            "Add AI settings in the sidebar.")
-                    lines = [l.strip() for l in prompt.strip().splitlines() if l.strip()]
-                    head = [("h", 1, lines[0][:70])]
-                    rest = [("p", l) for l in lines[1:]] if len(lines) > 1 else []
-                    items = head + rest
-                out_path, doc_title, _ = render(items, theme, cover=True,
-                                                subtitle=prompt.strip().splitlines()[0][:90])
-                st.session_state["ai_out"] = out_path
-                st.session_state["last_mode"] = "Prompt"
-                log_history({"time": time.strftime("%Y-%m-%d %H:%M"), "source": "Prompt",
-                             "title": doc_title, "theme": theme,
-                             "pages": fitz.open(out_path).page_count})
-            except Exception as e:
-                st.error(f"Generation failed: {e}")
-    if st.session_state.get("ai_out") and os.path.isfile(st.session_state["ai_out"]):
-        st.success(f"Saved to {os.path.basename(st.session_state['ai_out'])}")
-        show_pdf(st.session_state["ai_out"])
-with tab_file:
-    st.subheader("Turn a file into pretty notes")
-    up = st.file_uploader("Upload a PDF / TXT / MD", type=["pdf", "txt", "md"])
-    existing = sorted(glob.glob(os.path.join(NOTES_DIR, "*")))
-    existing = [f for f in existing if f.lower().endswith((".pdf", ".txt", ".md"))]
-    picked = st.selectbox("…or pick one already in notes/",
-                          ["—"] + [os.path.basename(f) for f in existing])
-    c_ai, c_ocr = st.columns(2)
-    use_ai = c_ai.checkbox("🤖 AI-condense content", value=False,
-                           help="Requires AI settings.")
-    use_ocr = c_ocr.checkbox("🧠 OCR scanned PDFs", value=False,
-                             help="Reads image-only PDFs" +
-                             ("" if ocr_available() else " (needs 'pip install rapidocr_onnxruntime')"))
-    extra = st.text_input("Extra instruction for AI (optional)",
-                          placeholder="e.g. focus on definitions and dates")
-    preset_label2 = st.selectbox("AI style", list(PRESET_NAMES))
-    if st.button("📄 Generate Notes from File"):
-        src = None
-        if up is not None:
-            src = os.path.join(NOTES_DIR, up.name)
-            open(src, "wb").write(up.getvalue())
-        elif picked != "—":
-            src = os.path.join(NOTES_DIR, picked)
-        if src is None:
-            st.warning("Upload a file or pick one from the list.")
-        else:
-            try:
-                if use_ai:
-                    if not ai_notes.ai_ready(cfg):
-                        st.error("AI not configured — uncheck the box or add settings in the sidebar.")
-                    else:
-                        with st.spinner("AI is condensing your content..."):
-                            items = extract_text(src, use_ocr=use_ocr)
-                            raw = " ".join((t[2] if t[0] == "h" else t[1]) if len(t) > 1 else str(t)
-                                           for t in items)
-                            doc = ai_notes.ai_summarize_notes(raw, PRESET_NAMES[preset_label2], extra, cfg)
-                            out_path, doc_title, _ = render(ai_notes.doc_to_items(doc), theme,
-                                                            cover=True, subtitle=os.path.basename(src))
-                            if doc.get("cards"):
-                                export.anki_deck(doc["cards"], out_path[:-4] + "_flashcards.txt")
-                            log_history({"time": time.strftime("%Y-%m-%d %H:%M"),
-                                         "source": os.path.basename(src), "title": doc_title,
-                                         "theme": theme, "pages": fitz.open(out_path).page_count,
-                                         "flashcards": len(doc.get("cards", []))})
-                            st.session_state["file_out"] = out_path
-                else:
-                    items = extract_text(src, use_ocr=use_ocr)
-                    out_path, doc_title, _ = render(items, theme, cover=True,
-                                                    subtitle=os.path.basename(src))
-                    log_history({"time": time.strftime("%Y-%m-%d %H:%M"),
-                                 "source": os.path.basename(src), "title": doc_title,
-                                 "theme": theme, "pages": fitz.open(out_path).page_count})
-                    st.session_state["file_out"] = out_path
-            except Exception as e:
-                if "No content found" in str(e):
-                    st.error("This PDF has no readable text. Try checking the "
-                             "OCR box (scanned pages), or use a text PDF / .txt.")
-                else:
-                    st.error(f"Could not generate notes: {e}")
-    if st.session_state.get("file_out") and os.path.isfile(st.session_state["file_out"]):
-        st.success(f"Saved to {os.path.basename(st.session_state['file_out'])}")
-        show_pdf(st.session_state["file_out"])
-
-with tab_edit:
-    st.subheader("✏️ Edit a PDF")
-    st.caption("True vector edits — inserted text stays sharp and searchable, "
-               "and the original file is never modified until you save a copy.")
-
-    _pdfs = pdf_editor.list_editable_pdfs()
-    if not _pdfs:
-        st.info("No PDFs yet — generate one in tab 2 (or drop a PDF into notes/).")
-    else:
-        _names = [os.path.basename(p) for p in _pdfs]
-        e_sel = st.selectbox("PDF to edit", _names, key="ed_sel")
-        e_src = _pdfs[_names.index(e_sel)]
-
-        # (re)open the editor whenever the chosen file changes
-        if st.session_state.get("ed_src") != e_src:
-            _old = st.session_state.get("ed_obj")
-            if _old is not None:
-                try:
-                    _old.close()
-                except Exception:
-                    pass
-            st.session_state["ed_obj"] = pdf_editor.PDFEditor(e_src)
-            st.session_state["ed_src"] = e_src
-            st.session_state.pop("ed_saved", None)
-        ed = st.session_state["ed_obj"]
-
-        c_pg, c_dpi, c_undo = st.columns([1, 1, 1])
-        e_page = c_pg.number_input("Page", min_value=1, max_value=ed.page_count,
-                                   value=1, step=1, key="ed_page")
-        e_dpi = c_dpi.slider("Preview quality", 60, 170, 100, 10, key="ed_dpi")
-        if c_undo.button("↶ Undo last edit", key="ed_undo"):
-            if ed.undo():
-                st.rerun()
-            else:
-                st.toast("Nothing to undo")
-        _pw, _ph = ed.page_size(e_page)
-        st.caption(f"{ed.page_count} page(s) · {_pw:.0f}×{_ph:.0f} pt · "
-                   f"{ed.layer_count(e_page)} edit(s) on this page")
-
-        st.image(ed.render_preview(e_page, dpi=e_dpi), width="stretch")
-
-        with st.expander("✍️ Insert text", expanded=False):
-            t_txt = st.text_area("Text to add", key="ed_t_text", height=70,
-                                 placeholder="Type the text you want on the page")
-            c1, c2, c3 = st.columns(3)
-            t_x = c1.number_input("X (pt)", 0.0, 2000.0, 60.0, 5.0, key="ed_t_x")
-            t_y = c2.number_input("Y (pt)", 0.0, 2000.0, 120.0, 5.0, key="ed_t_y")
-            t_size = c3.number_input("Font size", 6.0, 48.0, 15.0, 1.0,
-                                     key="ed_t_size")
-            c4, c5, c6 = st.columns(3)
-            t_font = c4.selectbox("Handwriting font",
-                                  list(pdf_editor.FONT_CHOICES), key="ed_t_font")
-            t_col = c5.color_picker("Colour", "#2D323C", key="ed_t_col")
-            t_rot = c6.slider("Tilt (°)", -15.0, 15.0, 0.0, 0.5, key="ed_t_rot")
-            if st.button("➕ Add text", key="ed_t_go") and t_txt.strip():
-                ed.add_text(e_page, t_txt, t_x, t_y, t_size, _hex_rgb(t_col),
-                            pdf_editor.FONT_CHOICES[t_font], t_rot)
-                st.rerun()
-
-        with st.expander("🔁 Replace or erase existing text", expanded=False):
-            st.caption("Searches this page for the exact text and redacts it.")
-            r_find = st.text_input("Find text", key="ed_r_find",
-                                   placeholder="text you want to change")
-            r_new = st.text_input("Replace with (leave empty to just erase)",
-                                  key="ed_r_new")
-            c7, c8 = st.columns(2)
-            r_font = c7.selectbox("Font for replacement",
-                                  list(pdf_editor.FONT_CHOICES), key="ed_r_font")
-            r_col = c8.color_picker("Colour", "#2D323C", key="ed_r_col")
-            if st.button("🔁 Apply", key="ed_r_go") and r_find.strip():
-                hits = ed.find_text(e_page, r_find)
-                if not hits:
-                    st.warning("That text was not found on this page.")
-                else:
-                    if r_new.strip():
-                        ed.replace_text(e_page, r_find, r_new, None,
-                                        _hex_rgb(r_col),
-                                        pdf_editor.FONT_CHOICES[r_font])
-                    else:
-                        ed.erase_text(e_page, r_find)
-                    st.success(f"{len(hits)} occurrence(s) updated.")
-                    st.rerun()
-        with st.expander("🖼 Insert an image", expanded=False):
-            i_up = st.file_uploader("Image (PNG / JPG)", type=["png", "jpg", "jpeg"],
-                                    key="ed_i_up")
-            c9, c10, c11 = st.columns(3)
-            i_x = c9.number_input("X (pt)", 0.0, 2000.0, 380.0, 5.0, key="ed_i_x")
-            i_y = c10.number_input("Y (pt)", 0.0, 2000.0, 120.0, 5.0, key="ed_i_y")
-            i_w = c11.number_input("Width (pt)", 20.0, 900.0, 150.0, 10.0,
-                                   key="ed_i_w")
-            i_keep = st.checkbox("Keep aspect ratio", value=True, key="ed_i_keep")
-            if st.button("➕ Stamp image", key="ed_i_go"):
-                if i_up is None:
-                    st.warning("Choose an image file first.")
-                else:
-                    dst = os.path.join(UPLOAD_DIR, i_up.name)
-                    with open(dst, "wb") as f:
-                        f.write(i_up.getvalue())
-                    ed.add_image(e_page, dst, i_x, i_y, i_w,
-                                 None if i_keep else i_w * 0.75)
-                    st.rerun()
-
-        with st.expander("🗒 Sticky note", expanded=False):
-            s_txt = st.text_area("Note text", key="ed_s_txt", height=70)
-            c12, c13, c14, c15 = st.columns(4)
-            s_x = c12.number_input("X (pt)", 0.0, 2000.0, 380.0, 5.0, key="ed_s_x")
-            s_y = c13.number_input("Y (pt)", 0.0, 2000.0, 240.0, 5.0, key="ed_s_y")
-            s_w = c14.number_input("Width", 25.0, 400.0, 90.0, 5.0, key="ed_s_w")
-            s_h = c15.number_input("Height", 20.0, 400.0, 55.0, 5.0, key="ed_s_h")
-            s_col = st.select_slider("Sticky colour",
-                                     list(pdf_editor.STICKY_COLORS),
-                                     value="yellow", key="ed_s_col")
-            if st.button("➕ Add sticky", key="ed_s_go") and s_txt.strip():
-                ed.add_sticky(e_page, s_txt, s_x, s_y, s_w, s_h,
-                              pdf_editor.STICKY_COLORS[s_col])
-                st.rerun()
-
-        with st.expander("🖍 Highlight · shapes · whiteout · draw",
-                         expanded=False):
-            c16, c17, c18, c19 = st.columns(4)
-            h_x = c16.number_input("X (pt)", 0.0, 2000.0, 60.0, 5.0, key="ed_h_x")
-            h_y = c17.number_input("Y (pt)", 0.0, 2000.0, 200.0, 5.0, key="ed_h_y")
-            h_w = c18.number_input("W (pt)", 5.0, 1200.0, 140.0, 5.0, key="ed_h_w")
-            h_h = c19.number_input("H (pt)", 5.0, 1200.0, 40.0, 5.0, key="ed_h_h")
-            c20, c21, c22 = st.columns(3)
-            h_col = c20.color_picker("Colour", "#FFE082", key="ed_h_col")
-            a_shape = c21.selectbox("Shape", ["rect", "circle", "arrow", "line"],
-                                    key="ed_h_shape")
-            a_fill = c22.checkbox("Fill shape", value=False, key="ed_h_fill")
-            b17, b18, b19, b20 = st.columns(4)
-            if b17.button("🖍 Highlight", key="ed_h_hl"):
-                ed.add_highlight(e_page, h_x, h_y, h_w, h_h, _hex_rgb(h_col))
-                st.rerun()
-            if b18.button("➕ Shape", key="ed_h_sh"):
-                ed.add_shape(e_page, a_shape, h_x, h_y, h_w, h_h,
-                             _hex_rgb(h_col), a_fill)
-                st.rerun()
-            if b19.button("⬜ Whiteout", key="ed_h_wo"):
-                ed.add_whiteout(e_page, h_x, h_y, h_w, h_h)
-                st.rerun()
-            if b20.button(" Erase area", key="ed_h_er"):
-                ed.add_whiteout(e_page, h_x, h_y, h_w, h_h, erase=True)
-                st.rerun()
-
-        from whiteboard import whiteboard_panel
-
-        with st.expander("🖊 Digital board — draw & stamp", expanded=True):
-            st.caption("Write with your **pen / stylus / mouse / touch** on the "
-                       "canvas, then stamp the sheet into the PDF. "
-                       "Pressure-sensitive pens work like a normal canvas.")
-            wb_file = whiteboard_panel()
-            wb1, wb2 = st.columns([1, 1])
-            if wb1.button("📌 Stamp board as full page",
-                          key="ed_wb_stamp", disabled=not wb_file):
-                if wb_file:
-                    dst = os.path.join(UPLOAD_DIR, os.path.basename(wb_file))
-                    if dst != wb_file:
-                        open(dst, "wb").write(open(wb_file, "rb").read())
-                    ed.add_board(e_page, dst)
-                    st.rerun()
-            if wb2.button("🧽 Discard board", key="ed_wb_clear",
-                          disabled=not wb_file):
-                try:
-                    os.remove(wb_file)
-                except OSError:
-                    pass
-                st.session_state.pop("wb_file", None)
-                st.rerun()
-            st.caption("Freehand — type the points in order as 'x,y' pairs.")
-            pts_raw = st.text_input("Points, e.g. 60,300 80,310 100,295",
-                                    key="ed_d_pts")
-            if st.button("✏️ Draw stroke", key="ed_d_go") and pts_raw.strip():
-                pts = []
-                for chunk in pts_raw.replace(";", " ").split():
-                    if "," in chunk:
-                        try:
-                            px, py = chunk.split(",")[:2]
-                            pts.append((float(px), float(py)))
-                        except ValueError:
-                            continue
-                if len(pts) >= 2:
-                    ed.add_drawing(e_page, pts, _hex_rgb(h_col))
-                    st.rerun()
-                else:
-                    st.warning("Give at least two 'x,y' pairs.")
-        with st.expander(" Page tools", expanded=False):
-            p1, p2, p3, p4 = st.columns(4)
-            if p1.button(" Rotate 90°", key="ed_p_rot"):
-                ed.rotate_page(e_page, 90)
-                st.rerun()
-            if p2.button(" Duplicate", key="ed_p_dup"):
-                ed.duplicate_page(e_page)
-                st.rerun()
-            if p3.button("➕ Blank page", key="ed_p_blank"):
-                ed.insert_blank_page(e_page)
-                st.rerun()
-            if p4.button(" Delete page", key="ed_p_del"):
-                try:
-                    ed.delete_page(e_page)
-                    st.rerun()
-                except Exception as e:
-                    st.error(str(e))
-            c23, c24 = st.columns(2)
-            m_to = c23.number_input("Move this page to position",
-                                    min_value=1, max_value=ed.page_count,
-                                    value=1, step=1, key="ed_p_to")
-            if c24.button("➡ Move", key="ed_p_move"):
-                ed.move_page(e_page, m_to)
-                st.rerun()
-            if st.button("🧹 Clear edits on this page", key="ed_p_clear"):
-                ed.clear_page(e_page)
-                st.rerun()
-
-        st.divider()
-        c25, c26 = st.columns([2, 1])
-        _default_name = os.path.splitext(e_sel)[0] + "_edited.pdf"
-        save_name = c25.text_input("Save as (inside output/)",
-                                   value=_default_name, key="ed_save_name")
-        if c26.button("💾 Save edited PDF", type="primary", key="ed_save_go"):
-            if not save_name.lower().endswith(".pdf"):
-                save_name += ".pdf"
-            try:
-                out_p = ed.save(os.path.join(OUT_DIR, save_name))
-                st.session_state["ed_saved"] = out_p
-                log_history({"time": time.strftime("%Y-%m-%d %H:%M"),
-                             "source": "Editor", "title": save_name,
-                             "theme": "-", "pages": ed.page_count})
-            except Exception as e:
-                st.error(f"Save failed: {e}")
-        _sp = st.session_state.get("ed_saved")
-        if _sp and os.path.isfile(_sp):
-            st.success(f"Saved {os.path.basename(_sp)}")
-            if st.button("📂 Open saved PDF", key="ed_open"):
-                if os.name == "nt":
-                    os.startfile(_sp)  # local Windows only
-                else:
-                    st.info("On Streamlit Cloud use the Download button below.")
-            with open(_sp, "rb") as f:
-                st.download_button(" Download edited PDF", data=f.read(),
-                                   file_name=os.path.basename(_sp),
-                                   mime="application/pdf")
-with tab_batch:
-    st.subheader("Convert a whole folder at once")
-    folder = st.text_input("Folder path", value=NOTES_DIR)
-    combine = st.checkbox("🔗 Combine all results into one master PDF", value=True)
-    theme_b = st.selectbox("Theme for batch", list_themes(), index=0)
-    ocr_b = st.checkbox("🧠 OCR scanned pages", value=False)
-    if st.button("🚀 Run Batch"):
-        files = sorted(glob.glob(os.path.join(folder, "*.pdf")) +
-                       glob.glob(os.path.join(folder, "*.txt")) +
-                       glob.glob(os.path.join(folder, "*.md")))
-        if not files:
-            st.warning("No PDF/TXT/MD files found in that folder.")
-        else:
-            done, skipped = [], []
-            bar = st.progress(0.0)
-            for i, f in enumerate(files):
-                bar.progress((i + 1) / len(files))
-                try:
-                    out, t, _ = render(extract_text(f, use_ocr=ocr_b), theme_b,
-                                       cover=True, subtitle=os.path.basename(f))
-                    done.append(out)
-                except Exception as e:
-                    skipped.append((os.path.basename(f), str(e)[:80]))
-            bar.empty()
-            if combine and done:
-                ts = time.strftime("%Y%m%d_%H%M%S")
-                master = os.path.join(OUT_DIR, f"master_{ts}_{theme_b}.pdf")
-                export.merge_pdfs(done, master)
-                st.session_state["batch_out"] = master
-            log_history({"time": time.strftime("%Y-%m-%d %H:%M"), "source": "Batch",
-                         "title": f"{len(done)} files", "theme": theme_b,
-                         "pages": len(done), "skipped": len(skipped)})
-            st.success(f"Done: {len(done)} ok, {len(skipped)} skipped")
-            for name, err in skipped[:8]:
-                st.caption(f"⚠ {name}: {err}")
-    if st.session_state.get("batch_out") and os.path.isfile(st.session_state["batch_out"]):
-        st.success(f"Master PDF: {os.path.basename(st.session_state['batch_out'])}")
-        show_pdf(st.session_state["batch_out"])
-
-with tab_out:
-    st.subheader("Your generated notes")
-    hist = []
-    if os.path.isfile(HISTORY_FILE):
-        try:
-            hist = json.load(open(HISTORY_FILE, encoding="utf-8"))
-        except Exception:
-            hist = []
-    if hist:
-        with st.expander("🕘 History", expanded=False):
-            st.table([{k: str(v)[:22] for k, v in h.items()} for h in hist[:12]])
-    files = outputs_list()
-    if not files:
-        st.info("Nothing here yet — generate your first notes!")
-    else:
-        sel = st.selectbox("Choose a PDF", [os.path.basename(f) for f in files])
-        path = os.path.join(OUT_DIR, sel)
-        b1, b2, b3 = st.columns([1, 1, 1])
-        if b1.button("📂 Open"):
-            if os.name == "nt":
-                os.startfile(path)  # local Windows only
-            else:
-                st.info("On Streamlit Cloud use ⬇ Export → download instead.")
-        if b2.button("🗑 Delete"):
-            os.remove(path)
+    if st.button("↶ Undo last edit"):
+        if ed.undo():
+            bump()
             st.rerun()
-        with b3.popover("⬇ Export"):
-            if st.button("HTML preview"):
-                h, _ = export.to_html(path, OUT_DIR)
-                st.success(os.path.basename(h))
-            if st.button("PNG pages"):
-                ps = export.pdf_to_pngs(path, OUT_DIR, dpi=110)
-                st.success(f"{len(ps)} PNGs saved")
-            if st.button("Word (.docx)"):
-                items = extract_text(path)
-                d = export.to_docx(sel[:-4], items, path[:-4] + ".docx")
-                st.success(os.path.basename(d))
-        st.caption(f"{sel} — {time.strftime('%Y-%m-%d %H:%M', time.localtime(os.path.getmtime(path)))}")
-        show_pdf(path)
+        else:
+            st.info("Nothing left to undo (page deletes/duplicates can't be "
+                    "reversed).")
+
+    with st.expander("🧰 Page operations"):
+        c1, c2 = st.columns(2)
+        if c1.button("↻ Rot +90°"):
+            ed.rotate_page(st.session_state.page, 90)
+            bump()
+        if c2.button("↺ Rot −90°"):
+            ed.rotate_page(st.session_state.page, -90)
+            bump()
+        c3, c4 = st.columns(2)
+        if c3.button("⧉ Duplicate"):
+            ed.duplicate_page(st.session_state.page)
+            bump()
+            st.rerun()
+        if c4.button("＋ Blank after"):
+            ed.insert_blank_page(st.session_state.page)
+            bump()
+            st.rerun()
+        c5, c6 = st.columns(2)
+        to_p = c5.number_input("Move to #", min_value=1,
+                               max_value=ed.page_count,
+                               value=st.session_state.page, key="mv_pick")
+        if c6.button("⇄ Move") and to_p != st.session_state.page:
+            ed.move_page(st.session_state.page, int(to_p))
+            st.session_state.page = int(to_p)
+            bump()
+            st.rerun()
+        if st.button("🗑 Delete this page", type="primary"):
+            try:
+                ed.delete_page(st.session_state.page)
+                st.session_state.page = min(st.session_state.page,
+                                            ed.page_count)
+                bump()
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
+
+    st.subheader("3 · Save")
+    default_name = (os.path.splitext(st.session_state.src_name)[0]
+                    + "_edited.pdf")
+    out_name = st.text_input("File name", value=default_name)
+    if st.button("💾 Save edited PDF"):
+        out_path = os.path.join(OUT_DIR, out_name)
+        try:
+            ed.save(out_path)
+            st.session_state.last_saved = out_path
+            st.success(f"Saved: {out_name}")
+            pagewrite.clear_overlays(keep=12)
+        except Exception as e:
+            st.error(f"Save failed: {e}")
+    if st.session_state.get("last_saved") and os.path.isfile(
+            st.session_state.last_saved):
+        with open(st.session_state.last_saved, "rb") as f:
+            st.download_button("⬇ Download edited PDF", f.read(),
+                               file_name=os.path.basename(
+                                   st.session_state.last_saved),
+                               mime="application/pdf")
+
+
+
+# ---- main: the writeable page ----------------------------------------------
+
+st.subheader(f"✍️ Writing on page {st.session_state.page} of {ed.page_count}")
+st.caption("Draw straight on the page with your pen / stylus / touch / mouse. "
+           "Press **✅ Apply to PDF** and the ink lands exactly where you "
+           "drew it — at print resolution, as a real overlay you can undo "
+           "or save.")
+
+page = st.session_state.page
+pw_pt, ph_pt = ed.page_size(page)
+bg_png = ed.render_raw_preview(page, dpi=110)
+
+canvas_val = pagewrite.page_canvas(
+    bg_png, pw_pt, ph_pt, page - 1, st.session_state.token,
+    pages=ed.page_count, key="pwcanvas",
+)
+
+# component payloads: react to each (action, seq) exactly once
+data = pagewrite.parse(canvas_val)
+seq = data.get("seq")
+if seq is not None and seq != st.session_state.pw_seq:
+    st.session_state.pw_seq = seq
+    action = data.get("action")
+    if action == "nav":
+        try:
+            new_page = int(data.get("page", page - 1)) + 1
+        except (TypeError, ValueError):
+            new_page = page
+        if 1 <= new_page <= ed.page_count:
+            st.session_state.page = new_page
+        bump()
+        st.rerun()
+    elif action == "ink":
+        ink_path, _sx, _sy = pagewrite.save_overlay(data)
+        if ink_path:
+            ed.add_page_ink(page, ink_path)
+            st.toast(f"Stamped {data.get('strokes', '?')} stroke(s) onto "
+                     f"page {page}")
+            bump()
+            st.rerun()
+        else:
+            st.warning("The canvas sent an empty overlay — draw something "
+                       "first.")
+
+with st.expander("👁 Preview with all edits applied (this page)"):
+    st.image(ed.render_preview(page, dpi=110), width="stretch")
+
+prev1, prev2 = st.columns([3, 2])
+with prev1:
+    with st.expander("📜 Page text (useful for find & replace)"):
+        st.text(ed.page_text(page, max_chars=2500) or "(no text on this page)")
+with prev2:
+    with st.expander("⚠️ Clear all edits on this page"):
+        if st.button("Clear this page's edits"):
+            ed.clear_page(page)
+            bump()
+            st.rerun()
+
+
+
+# ---- object tools -----------------------------------------------------------
+
+st.subheader("🧷 Place objects on this page")
+st.caption("Coordinates are PDF points (1 pt = 1/72 inch). The page is "
+           f"{pw_pt:.0f} × {ph_pt:.0f} pt.")
+
+FONT_KEYS = list(FONT_CHOICES.values())
+FONT_LABELS = list(FONT_CHOICES.keys())
+STICKY_KEYS = list(STICKY_COLORS.keys())
+
+tools = st.columns(3)
+
+with tools[0]:
+    with st.expander("🔤 Handwritten text"):
+        t_txt = st.text_area("Text", "your note here", key="t_txt")
+        t_x = st.number_input("X", 0.0, pw_pt, 60.0, key="t_x")
+        t_y = st.number_input("Y", 0.0, ph_pt, 80.0, key="t_y")
+        t_size = st.slider("Size", 6.0, 36.0, 13.0, key="t_size")
+        t_font = st.selectbox("Font", FONT_LABELS, key="t_font")
+        t_col = st.color_picker("Colour", "#20242e", key="t_col")
+        t_rot = st.slider("Rotation °", -90.0, 90.0, 0.0, key="t_rot")
+        if st.button("Add text", key="t_add"):
+            if t_txt.strip():
+                ed.add_text(page, t_txt, float(t_x), float(t_y),
+                            size=float(t_size), color=hex_rgb(t_col),
+                            font=FONT_KEYS[FONT_LABELS.index(t_font)],
+                            rotation=float(t_rot))
+                bump()
+                st.rerun()
+            else:
+                st.warning("Type some text first.")
+
+    with st.expander("🗂 Sticky note"):
+        s_txt = st.text_area("Note text", "", key="s_txt")
+        s_col = st.selectbox("Colour", STICKY_KEYS, key="s_col")
+        s_x = st.number_input("X", 0.0, pw_pt, 380.0, key="s_x")
+        s_y = st.number_input("Y", 0.0, ph_pt, 80.0, key="s_y")
+        s_w = st.slider("Width", 40.0, 400.0, 140.0, key="s_w")
+        s_h = st.slider("Height", 30.0, 300.0, 80.0, key="s_h")
+        if st.button("Add sticky", key="s_add") and s_txt.strip():
+            ed.add_sticky(page, s_txt, float(s_x), float(s_y),
+                          w=float(s_w), h=float(s_h),
+                          color=STICKY_COLORS[s_col])
+            bump()
+            st.rerun()
+
+with tools[1]:
+    with st.expander("🖼 Image"):
+        i_up = st.file_uploader("Image (png/jpg)",
+                                type=["png", "jpg", "jpeg"], key="i_up")
+        i_x = st.number_input("X", 0.0, pw_pt, 60.0, key="i_x")
+        i_y = st.number_input("Y", 0.0, ph_pt, 200.0, key="i_y")
+        i_w = st.number_input("Width pt (0 = auto)", 0.0, 2000.0, 200.0,
+                              key="i_w")
+        i_h = st.number_input("Height pt (0 = auto)", 0.0, 2000.0, 0.0,
+                              key="i_h")
+        if st.button("Add image", key="i_add") and i_up is not None:
+            ext = os.path.splitext(i_up.name)[1].lower() or ".png"
+            dest = os.path.join(UPLOAD_DIR, f"img_{int(time.time())}{ext}")
+            with open(dest, "wb") as f:
+                f.write(i_up.getvalue())
+            ed.add_image(page, dest, float(i_x), float(i_y),
+                         w=float(i_w) or None, h=float(i_h) or None)
+            bump()
+            st.rerun()
+
+    with st.expander("⬜ Shape"):
+        sh_shape = st.selectbox("Shape", ["rect", "circle", "arrow", "line"],
+                                key="sh_shape")
+        sh_x = st.number_input("X", 0.0, pw_pt, 100.0, key="sh_x")
+        sh_y = st.number_input("Y", 0.0, ph_pt, 100.0, key="sh_y")
+        sh_w = st.number_input("W", 1.0, pw_pt, 150.0, key="sh_w")
+        sh_h = st.number_input("H", 1.0, ph_pt, 60.0, key="sh_h")
+        sh_col = st.color_picker("Colour", "#d04a4a", key="sh_col")
+        sh_fill = st.checkbox("Filled", key="sh_fill")
+        sh_bw = st.slider("Line width", 0.4, 4.0, 1.0, key="sh_bw")
+        if st.button("Add shape", key="sh_add"):
+            ed.add_shape(page, sh_shape, float(sh_x), float(sh_y),
+                         float(sh_w), float(sh_h), color=hex_rgb(sh_col),
+                         fill=sh_fill, bw=float(sh_bw))
+            bump()
+            st.rerun()
+
+
+with tools[2]:
+    with st.expander("🖍 Highlight area"):
+        hl_x = st.number_input("X", 0.0, pw_pt, 60.0, key="hl_x")
+        hl_y = st.number_input("Y", 0.0, ph_pt, 100.0, key="hl_y")
+        hl_w = st.number_input("W", 1.0, pw_pt, 200.0, key="hl_w")
+        hl_h = st.number_input("H", 1.0, ph_pt, 16.0, key="hl_h")
+        hl_col = st.color_picker("Colour", "#ffeb82", key="hl_col")
+        if st.button("Add highlight", key="hl_add"):
+            ed.add_highlight(page, float(hl_x), float(hl_y),
+                             float(hl_w), float(hl_h), color=hex_rgb(hl_col))
+            bump()
+            st.rerun()
+
+    with st.expander("🧽 Whiteout area"):
+        wo_erase = st.checkbox("Erase underlying text too (redaction)",
+                               key="wo_erase")
+        wo_x = st.number_input("X", 0.0, pw_pt, 60.0, key="wo_x")
+        wo_y = st.number_input("Y", 0.0, ph_pt, 100.0, key="wo_y")
+        wo_w = st.number_input("W", 1.0, pw_pt, 200.0, key="wo_w")
+        wo_h = st.number_input("H", 1.0, ph_pt, 20.0, key="wo_h")
+        if st.button("Add whiteout", key="wo_add"):
+            ed.add_whiteout(page, float(wo_x), float(wo_y),
+                            float(wo_w), float(wo_h), erase=wo_erase)
+            bump()
+            st.rerun()
+
+    with st.expander("🔁 Find & replace / erase text"):
+        fr_find = st.text_input("Find text", "", key="fr_find")
+        fr_repl = st.text_input("Replace with (empty = erase)", "",
+                                key="fr_repl")
+        fr_font = st.selectbox("Font", FONT_LABELS, key="fr_font")
+        fr_col = st.color_picker("Colour", "#1f5fa8", key="fr_col")
+        if st.button("Apply to all matches", key="fr_add") and fr_find.strip():
+            hits = ed.find_text(page, fr_find)
+            if not hits:
+                st.warning("No matches on this page.")
+            elif fr_repl.strip():
+                ed.replace_text(page, fr_find, fr_repl,
+                                color=hex_rgb(fr_col),
+                                font=FONT_KEYS[FONT_LABELS.index(fr_font)])
+                st.success(f"{len(hits)} match(es) replaced.")
+                bump()
+            else:
+                ed.erase_text(page, fr_find)
+                st.success(f"{len(hits)} match(es) erased.")
+                bump()
+
+st.caption("PDF Write Studio · vector overlays via PyMuPDF · your source "
+           "file is never modified — Save writes a new PDF.")
 

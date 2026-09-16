@@ -1,60 +1,52 @@
-# 🎨 Notes Studio — Beautiful Handwritten-Style Notes
+# 🖋 PDF Write Studio
 
-Turn **reference PDFs, topic notes, or a plain prompt** into colourful
-handwritten-style study notes — then edit them right in the app.
+Open **any PDF** and write directly **on the page** — with a digital pen,
+stylus, touchscreen, or mouse. Every edit is a true vector overlay drawn by
+[PyMuPDF](https://pymupdf.readthedocs.io/), so text stays razor-sharp at any
+zoom, files stay small, and your **source PDF is never modified** — Save
+always writes a new file.
 
-## ✨ The 3 sections
+## ✨ What you can do
 
-| Tab | What it does |
+| Area | Features |
 |---|---|
-| **1️⃣ Research** | Paste a topic + optional PDFs / TXT / MD / URLs → AI compiles everything into one clean **Markdown file** (saved in `notes/`) |
-| **2️⃣ Notes** | Turn any MD / TXT / PDF (or a prompt) into a **pretty handwritten-style PDF** in `output/` — themes, AI condense, batch mode, PNG/HTML/DOCX/Anki exports |
-| **3️⃣ Editor** | Edit any generated PDF — **insert text, replace/erase text, insert images, sticky notes, highlights, shapes, whiteout, freehand draw**, plus page tools (undo, rotate, reorder, duplicate, delete, insert blank) |
+| **Write on the page** | Whole-page writeable canvas (the page *is* the canvas) — pen / marker / highlighter / eraser, pressure-sensitive strokes, per-canvas undo & clear, in-canvas page selector |
+| **Place objects** | Handwritten text (5 bundled handwriting fonts, rotation), sticky notes, images, shapes (rect / circle / arrow / line), highlight areas, whiteout (with optional true redaction) |
+| **Edit text** | Find & replace (true redact + rewrite in a handwriting font), erase text, page text viewer |
+| **Page tools** | Rotate, duplicate, insert blank, move, delete, undo stack, clear a page's edits |
+| **Output** | Save-as + one-click download; previews with all overlays applied |
 
 ## 🚀 Run it
 
 ```powershell
-# easiest — double-click:
-Start Notes Studio.bat
-
-# or manually:
-streamlit run app.py
+pip install -r requirements.txt
+streamlit run app.py          # or double-click  Start PDF Write Studio.bat
 ```
 
-Open **http://localhost:8501** in your browser.
+Then open a PDF from the sidebar (upload, or pick one from `output/` /
+`notes/`), draw on the page, press **✅ Apply to PDF** on the canvas, and
+**💾 Save** when you're done.
 
-## 🤖 AI setup (sidebar → AI Settings)
-
-- **Fast & free:** paste a [Groq](https://console.groq.com/keys) key (model `openai/gpt-oss-120b`, base URL `https://api.groq.com/openai/v1`)
-- **Fully offline:** run [Ollama](https://ollama.com), base URL `http://localhost:11434/v1`, model e.g. `qwen3:8b`
-- **Keys stay local:** settings live in `config.json`, master keys in `api_keys.md` — both are git-ignored, never committed
-
-No AI? Tabs 1–2 still work in basic offline mode.
-
-## 📁 Project layout
+## 🗂 Project layout
 
 ```
-AINotes/
-├── app.py                 # the Streamlit UI (all 3 sections + batch + history)
-├── research.py            # section 1: research & compile → markdown
-├── make_notes.py          # markdown/PDF → structured item stream
-├── renderer.py            # handwritten-style PDF engine (fpdf2)
-├── ai_notes.py            # multi-pass AI writer (OpenAI-compatible APIs)
-├── pdf_editor.py          # section 3: vector PDF editor (PyMuPDF)
-├── export.py / ocr.py     # PNG, HTML, DOCX, Anki, merge / scanned-PDF OCR
-├── themes.json            # sunset · ocean · meadow · berry palettes
-├── notes/                 # input files + saved research markdown
-└── output/                # generated PDFs live here
+app.py                  Streamlit UI (the whole editor)
+pdf_editor.py           Vector-overlay editing engine (PyMuPDF)
+pagewrite/              Whole-page writeable canvas custom component
+  +-- __init__.py       Python wrapper (declare_component protocol)
+  +-- frontend/         Static JS/HTML (pen input, no build step)
+assets/fonts/           Handwriting TTFs used by the text tools
+notes/                  Drop PDFs here to make them openable in the app
+output/                 Saved edited PDFs (+ working dirs, gitignored)
+_legacy/                Old note-generator code (kept for reference, unused)
 ```
 
-## 🧪 Verify everything works
+## 🔧 How the ink lands exactly where you drew it
 
-```powershell
-python tests_smoke.py     # markdown, arrows, sections, resume, themes, exports
-```
-
-## 🔑 Rotate a leaked key
-
-Revoke it at https://console.groq.com/keys, paste the new one into
-`api_keys.md` (or Sidebar → AI Settings), and you're done.
+1. The current page is rendered to a PNG and set as the canvas background —
+   so what you see is exactly where you write.
+2. Your strokes are kept in the browser (no Streamlit reruns while drawing).
+3. On **Apply**, a transparent ink-only PNG is sent to Python and stamped
+   onto the page at its full rect in PDF points — a 1:1 mapping, so strokes
+   land precisely and stay crisp when the PDF is zoomed or printed.
 
