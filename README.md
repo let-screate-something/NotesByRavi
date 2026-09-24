@@ -38,7 +38,6 @@ pagewrite/              Whole-page writeable canvas custom component
 assets/fonts/           Handwriting TTFs used by the text tools
 notes/                  Drop PDFs here to make them openable in the app
 output/                 Saved edited PDFs (+ working dirs, gitignored)
-_legacy/                Old note-generator code (kept for reference, unused)
 ```
 
 ## 🔧 How the ink lands exactly where you drew it
